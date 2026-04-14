@@ -2029,6 +2029,68 @@ class AIAgent:
             marker in assistant_text for marker in workspace_markers
         )
         return (user_targets_workspace or assistant_targets_workspace) and assistant_mentions_action
+
+    def _looks_like_internal_tool_protocol_text(self, text: str) -> bool:
+        """Detect malformed internal tool protocol text that should stay hidden from users."""
+        visible = self._strip_think_blocks(text or "").strip()
+        if not visible:
+            return False
+
+        lowered = visible.lower()
+        if any(tag in lowered for tag in ("<tool_call>", "</tool_call>", "<longcat_tool_call>", "</longcat_tool_call>")):
+            return True
+
+        route_markers = (
+            "to=functions.",
+            "to=multi_tool_use.",
+            "recipient_name=functions.",
+            "recipient_name=multi_tool_use.",
+            '"recipient_name":"functions.',
+            '"recipient_name":"multi_tool_use.',
+        )
+        payload_markers = (
+            "parameters=",
+            '"parameters":',
+            "arguments=",
+            '"arguments":',
+            "need proper json",
+        )
+        if any(marker in lowered for marker in route_markers) and any(
+            marker in lowered for marker in payload_markers
+        ):
+            return True
+
+        if visible.startswith("{") and visible.endswith("}"):
+            try:
+                payload = json.loads(visible)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                recipient_name = payload.get("recipient_name")
+                if isinstance(recipient_name, str) and (
+                    "functions." in recipient_name or "multi_tool_use." in recipient_name
+                ):
+                    return True
+
+                tool_name = payload.get("name")
+                if (
+                    isinstance(tool_name, str)
+                    and tool_name in set(getattr(self, "valid_tool_names", []) or [])
+                    and "arguments" in payload
+                ):
+                    return True
+
+                function_payload = payload.get("function")
+                if isinstance(function_payload, dict):
+                    function_name = function_payload.get("name")
+                    if (
+                        isinstance(function_name, str)
+                        and function_name in set(getattr(self, "valid_tool_names", []) or [])
+                        and "arguments" in function_payload
+                    ):
+                        return True
+
+        return False
     
     
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
@@ -4944,6 +5006,8 @@ class AIAgent:
         content = assistant_msg.get("content")
         visible = self._strip_think_blocks(content or "").strip()
         if not visible or visible == "(empty)":
+            return
+        if self._looks_like_internal_tool_protocol_text(visible):
             return
         already_streamed = self._interim_content_was_streamed(visible)
         try:

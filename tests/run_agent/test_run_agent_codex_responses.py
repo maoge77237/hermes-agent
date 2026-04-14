@@ -824,6 +824,82 @@ def test_interim_tool_call_commentary_is_suppressed(monkeypatch):
     assert observed == []
 
 
+def test_interim_malformed_tool_protocol_text_is_suppressed(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "to=multi_tool_use.parallel recipient_name=functions.terminal parameters={\"command\":\"pwd\"} Need proper JSON.",
+            "finish_reason": "incomplete",
+        }
+    )
+
+    assert observed == []
+
+
+def test_interim_raw_tool_call_block_is_suppressed(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": '<tool_call>{"name": "terminal", "arguments": {"command": "pwd"}}</tool_call>',
+            "finish_reason": "incomplete",
+        }
+    )
+
+    assert observed == []
+
+
+def test_interim_plain_json_status_is_not_suppressed(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": '{"summary": "ready", "status": "ok"}',
+            "finish_reason": "incomplete",
+        }
+    )
+
+    assert observed == [{"text": '{"summary": "ready", "status": "ok"}', "already_streamed": False}]
+
+
+def test_interim_harmless_name_arguments_json_is_not_suppressed(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": '{"name": "report", "arguments": "keep this visible"}',
+            "finish_reason": "incomplete",
+        }
+    )
+
+    assert observed == [{"text": '{"name": "report", "arguments": "keep this visible"}', "already_streamed": False}]
+
+
 def test_run_conversation_codex_continues_after_commentary_phase_message(monkeypatch):
     agent = _build_agent(monkeypatch)
     responses = [
