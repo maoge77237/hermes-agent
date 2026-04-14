@@ -12,7 +12,7 @@ import os
 import urllib.request
 import urllib.error
 from difflib import get_close_matches
-from typing import Any, NamedTuple, Optional
+from typing import Any, Optional
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
@@ -158,12 +158,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "kimi-k2-turbo-preview",
         "kimi-k2-0905-preview",
     ],
-    "kimi-coding-cn": [
-        "kimi-k2.5",
-        "kimi-k2-thinking",
-        "kimi-k2-turbo-preview",
-        "kimi-k2-0905-preview",
-    ],
     "moonshot": [
         "kimi-k2.5",
         "kimi-k2-thinking",
@@ -199,11 +193,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "mimo-v2-pro",
         "mimo-v2-omni",
         "mimo-v2-flash",
-    ],
-    "arcee": [
-        "trinity-large-thinking",
-        "trinity-large-preview",
-        "trinity-mini",
     ],
     "opencode-zen": [
         "gpt-5.4-pro",
@@ -490,56 +479,29 @@ def check_nous_free_tier() -> bool:
         return False  # default to paid on error — don't block users
 
 
-# ---------------------------------------------------------------------------
-# Canonical provider list — single source of truth for provider identity.
-# Every code path that lists, displays, or iterates providers derives from
-# this list:  hermes model, /model, /provider, list_authenticated_providers.
-#
-# Fields:
-#   slug        — internal provider ID (used in config.yaml, --provider flag)
-#   label       — short display name
-#   tier        — "top" (shown first) or "extended" (behind "More...")
-#   tui_desc    — longer description for the `hermes model` interactive picker
-# ---------------------------------------------------------------------------
-
-class ProviderEntry(NamedTuple):
-    slug: str
-    label: str
-    tier: str       # "top" or "extended"
-    tui_desc: str   # detailed description for `hermes model` TUI
-
-
-CANONICAL_PROVIDERS: list[ProviderEntry] = [
-    # -- Top tier (shown by default) --
-    ProviderEntry("nous",         "Nous Portal",              "top",      "Nous Portal (Nous Research subscription)"),
-    ProviderEntry("openrouter",   "OpenRouter",               "top",      "OpenRouter (100+ models, pay-per-use)"),
-    ProviderEntry("anthropic",    "Anthropic",                "top",      "Anthropic (Claude models — API key or Claude Code)"),
-    ProviderEntry("openai-codex", "OpenAI Codex",             "top",      "OpenAI Codex"),
-    ProviderEntry("qwen-oauth",   "Qwen OAuth (Portal)",      "top",      "Qwen OAuth (reuses local Qwen CLI login)"),
-    ProviderEntry("copilot",      "GitHub Copilot",           "top",      "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)"),
-    ProviderEntry("huggingface",  "Hugging Face",             "top",      "Hugging Face Inference Providers (20+ open models)"),
-    # -- Extended tier (behind "More..." in hermes model) --
-    ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "extended", "GitHub Copilot ACP (spawns `copilot --acp --stdio`)"),
-    ProviderEntry("gemini",         "Google AI Studio",         "extended", "Google AI Studio (Gemini models — OpenAI-compatible endpoint)"),
-    ProviderEntry("deepseek",       "DeepSeek",                 "extended", "DeepSeek (DeepSeek-V3, R1, coder — direct API)"),
-    ProviderEntry("xai",            "xAI",                      "extended", "xAI (Grok models — direct API)"),
-    ProviderEntry("zai",            "Z.AI / GLM",               "extended", "Z.AI / GLM (Zhipu AI direct API)"),
-    ProviderEntry("kimi-coding",    "Kimi / Moonshot",          "extended", "Kimi / Moonshot (Moonshot AI direct API)"),
-    ProviderEntry("kimi-coding-cn", "Kimi / Moonshot (China)",  "extended", "Kimi / Moonshot China (Moonshot CN direct API)"),
-    ProviderEntry("minimax",        "MiniMax",                  "extended", "MiniMax (global direct API)"),
-    ProviderEntry("minimax-cn",     "MiniMax (China)",          "extended", "MiniMax China (domestic direct API)"),
-    ProviderEntry("kilocode",       "Kilo Code",                "extended", "Kilo Code (Kilo Gateway API)"),
-    ProviderEntry("opencode-zen",   "OpenCode Zen",             "extended", "OpenCode Zen (35+ curated models, pay-as-you-go)"),
-    ProviderEntry("opencode-go",    "OpenCode Go",              "extended", "OpenCode Go (open models, $10/month subscription)"),
-    ProviderEntry("ai-gateway",     "AI Gateway",               "extended", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
-    ProviderEntry("alibaba",        "Alibaba Cloud (DashScope)","extended", "Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
-    ProviderEntry("xiaomi",         "Xiaomi MiMo",              "extended", "Xiaomi MiMo (MiMo-V2 models — pro, omni, flash)"),
-    ProviderEntry("arcee",          "Arcee AI",                 "extended", "Arcee AI (Trinity models — direct API)"),
-]
-
-# Derived dicts — used throughout the codebase
-_PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}
-_PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
+_PROVIDER_LABELS = {
+    "openrouter": "OpenRouter",
+    "openai-codex": "OpenAI Codex",
+    "copilot-acp": "GitHub Copilot ACP",
+    "nous": "Nous Portal",
+    "copilot": "GitHub Copilot",
+    "gemini": "Google AI Studio",
+    "zai": "Z.AI / GLM",
+    "kimi-coding": "Kimi / Moonshot",
+    "minimax": "MiniMax",
+    "minimax-cn": "MiniMax (China)",
+    "anthropic": "Anthropic",
+    "deepseek": "DeepSeek",
+    "opencode-zen": "OpenCode Zen",
+    "opencode-go": "OpenCode Go",
+    "ai-gateway": "AI Gateway",
+    "kilocode": "Kilo Code",
+    "alibaba": "Alibaba Cloud (DashScope)",
+    "qwen-oauth": "Qwen OAuth (Portal)",
+    "huggingface": "Hugging Face",
+    "xiaomi": "Xiaomi MiMo",
+    "custom": "Custom endpoint",
+}
 
 _PROVIDER_ALIASES = {
     "glm": "zai",
@@ -557,10 +519,6 @@ _PROVIDER_ALIASES = {
     "google-ai-studio": "gemini",
     "kimi": "kimi-coding",
     "moonshot": "kimi-coding",
-    "kimi-cn": "kimi-coding-cn",
-    "moonshot-cn": "kimi-coding-cn",
-    "arcee-ai": "arcee",
-    "arceeai": "arcee",
     "minimax-china": "minimax-cn",
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
@@ -586,9 +544,6 @@ _PROVIDER_ALIASES = {
     "huggingface-hub": "huggingface",
     "mimo": "xiaomi",
     "xiaomi-mimo": "xiaomi",
-    "grok": "xai",
-    "x-ai": "xai",
-    "x.ai": "xai",
 }
 
 
@@ -674,6 +629,13 @@ def model_ids(*, force_refresh: bool = False) -> list[str]:
     """Return just the OpenRouter model-id strings."""
     return [mid for mid, _ in fetch_openrouter_models(force_refresh=force_refresh)]
 
+
+def menu_labels(*, force_refresh: bool = False) -> list[str]:
+    """Return display labels like 'anthropic/claude-opus-4.6 (recommended)'."""
+    labels = []
+    for mid, desc in fetch_openrouter_models(force_refresh=force_refresh):
+        labels.append(f"{mid} ({desc})" if desc else mid)
+    return labels
 
 
 
@@ -874,20 +836,23 @@ def list_available_providers() -> list[dict[str, str]]:
 
     Each dict has ``id``, ``label``, and ``aliases``.
     Checks which providers have valid credentials configured.
-
-    Derives the provider list from :data:`CANONICAL_PROVIDERS` (single
-    source of truth shared with ``hermes model``, ``/model``, etc.).
     """
-    # Derive display order from canonical list + custom
-    provider_order = [p.slug for p in CANONICAL_PROVIDERS] + ["custom"]
-
+    # Canonical providers in display order
+    _PROVIDER_ORDER = [
+        "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
+        "gemini", "huggingface",
+        "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "anthropic", "alibaba",
+        "qwen-oauth", "xiaomi",
+        "opencode-zen", "opencode-go",
+        "ai-gateway", "deepseek", "custom",
+    ]
     # Build reverse alias map
     aliases_for: dict[str, list[str]] = {}
     for alias, canonical in _PROVIDER_ALIASES.items():
         aliases_for.setdefault(canonical, []).append(alias)
 
     result = []
-    for pid in provider_order:
+    for pid in _PROVIDER_ORDER:
         label = _PROVIDER_LABELS.get(pid, pid)
         alias_list = aliases_for.get(pid, [])
         # Check if this provider has credentials available
@@ -957,6 +922,19 @@ def _get_custom_base_url() -> str:
         model_cfg = config.get("model", {})
         if isinstance(model_cfg, dict):
             return str(model_cfg.get("base_url", "")).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _get_custom_api_key() -> str:
+    """Get the custom endpoint api_key from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        model_cfg = config.get("model", {})
+        if isinstance(model_cfg, dict):
+            return str(model_cfg.get("api_key", "")).strip()
     except Exception:
         pass
     return ""
@@ -1257,11 +1235,13 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "custom":
         base_url = _get_custom_base_url()
         if base_url:
-            # Try common API key env vars for custom endpoints
+            # Try common API key env vars for custom endpoints, then fall back
+            # to the config.yaml key used by the active custom model provider.
             api_key = (
                 os.getenv("CUSTOM_API_KEY", "")
                 or os.getenv("OPENAI_API_KEY", "")
                 or os.getenv("OPENROUTER_API_KEY", "")
+                or _get_custom_api_key()
             )
             live = fetch_api_models(api_key, base_url)
             if live:

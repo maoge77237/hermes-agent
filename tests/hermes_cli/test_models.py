@@ -3,10 +3,10 @@
 from unittest.mock import patch, MagicMock
 
 from hermes_cli.models import (
-    OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
+    OPENROUTER_MODELS, fetch_openrouter_models, menu_labels, model_ids, detect_provider_for_model,
     filter_nous_free_models, _NOUS_ALLOWED_FREE_MODELS,
     is_nous_free_tier, partition_nous_models_by_tier,
-    check_nous_free_tier, _FREE_TIER_CACHE_TTL,
+    check_nous_free_tier, _FREE_TIER_CACHE_TTL, provider_model_ids,
 )
 import hermes_cli.models as _models_mod
 
@@ -43,6 +43,27 @@ class TestModelIds:
         assert len(ids) == len(set(ids)), "Duplicate model IDs found"
 
 
+class TestMenuLabels:
+    def test_same_length_as_model_ids(self):
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            assert len(menu_labels()) == len(model_ids())
+
+    def test_first_label_marked_recommended(self):
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            labels = menu_labels()
+        assert "recommended" in labels[0].lower()
+
+    def test_each_label_contains_its_model_id(self):
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            for label, mid in zip(menu_labels(), model_ids()):
+                assert mid in label, f"Label '{label}' doesn't contain model ID '{mid}'"
+
+    def test_non_recommended_labels_have_no_tag(self):
+        """Only the first model should have (recommended)."""
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            labels = menu_labels()
+        for label in labels[1:]:
+            assert "recommended" not in label.lower(), f"Unexpected 'recommended' in '{label}'"
 
 
 
@@ -87,6 +108,51 @@ class TestFetchOpenRouterModels:
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == OPENROUTER_MODELS
+
+
+class TestProviderModelIds:
+    def test_custom_provider_falls_back_to_config_api_key_when_env_absent(self, monkeypatch):
+        for env_var in ("CUSTOM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+            monkeypatch.delenv(env_var, raising=False)
+
+        def _fake_fetch(api_key, base_url, timeout=5.0):
+            assert api_key == "cfg-key"
+            assert base_url == "https://example.com/v1"
+            return ["gpt-5.4", "gpt-5.4-mini"]
+
+        with patch("hermes_cli.models._get_custom_base_url", return_value="https://example.com/v1"), \
+             patch("hermes_cli.models._get_custom_api_key", return_value="cfg-key"), \
+             patch("hermes_cli.models.fetch_api_models", side_effect=_fake_fetch):
+            assert provider_model_ids("custom") == ["gpt-5.4", "gpt-5.4-mini"]
+
+    def test_custom_provider_env_api_key_still_takes_precedence(self, monkeypatch):
+        monkeypatch.setenv("CUSTOM_API_KEY", "env-key")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        def _fake_fetch(api_key, base_url, timeout=5.0):
+            assert api_key == "env-key"
+            assert base_url == "https://example.com/v1"
+            return ["gpt-5.4"]
+
+        with patch("hermes_cli.models._get_custom_base_url", return_value="https://example.com/v1"), \
+             patch("hermes_cli.models._get_custom_api_key", return_value="cfg-key"), \
+             patch("hermes_cli.models.fetch_api_models", side_effect=_fake_fetch):
+            assert provider_model_ids("custom") == ["gpt-5.4"]
+
+    def test_custom_provider_without_any_api_key_preserves_empty_key_probe(self, monkeypatch):
+        for env_var in ("CUSTOM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+            monkeypatch.delenv(env_var, raising=False)
+
+        def _fake_fetch(api_key, base_url, timeout=5.0):
+            assert api_key == ""
+            assert base_url == "https://example.com/v1"
+            return ["public-model"]
+
+        with patch("hermes_cli.models._get_custom_base_url", return_value="https://example.com/v1"), \
+             patch("hermes_cli.models._get_custom_api_key", return_value=""), \
+             patch("hermes_cli.models.fetch_api_models", side_effect=_fake_fetch):
+            assert provider_model_ids("custom") == ["public-model"]
 
 
 class TestFindOpenrouterSlug:
