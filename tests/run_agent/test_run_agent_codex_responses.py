@@ -798,6 +798,32 @@ def test_interim_commentary_is_not_marked_already_streamed_when_stream_callback_
     }
 
 
+def test_interim_tool_call_commentary_is_suppressed(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    observed = []
+
+    agent.interim_assistant_callback = lambda text, *, already_streamed=False: observed.append(
+        {"text": text, "already_streamed": already_streamed}
+    )
+
+    agent._emit_interim_assistant_message(
+        {
+            "role": "assistant",
+            "content": "Need proper JSON.",
+            "finish_reason": "tool_calls",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        }
+    )
+
+    assert observed == []
+
+
 def test_run_conversation_codex_continues_after_commentary_phase_message(monkeypatch):
     agent = _build_agent(monkeypatch)
     responses = [
