@@ -21,6 +21,37 @@ from urllib.parse import urlsplit
 logger = logging.getLogger(__name__)
 
 
+_DISPLAY_MEDIA_RE = re.compile(r'''[`"']?MEDIA:\s*\S+[`"']?''')
+_DISPLAY_PROTOCOL_LINE_RE = re.compile(
+    r'(?im)^[^\n]*(?:to=functions\.|to=multi_tool_use\.|recipient_name=functions\.|recipient_name=multi_tool_use\.)'
+    r'[^\n]*(?:parameters=|arguments=|need proper json)[^\n]*(?:\n|$)'
+)
+_DISPLAY_TOOL_BLOCK_LINE_RE = re.compile(
+    r'(?ims)^[ \t]*<(?:tool_call|longcat_tool_call)>.*?</(?:tool_call|longcat_tool_call)>[ \t]*(?:\n|$)'
+)
+_DISPLAY_TOOL_BLOCK_INLINE_RE = re.compile(
+    r'(?is)[ \t]*<(?:tool_call|longcat_tool_call)>.*?</(?:tool_call|longcat_tool_call)>[ \t]*'
+)
+_DISPLAY_OPEN_TOOL_BLOCK_TO_END_RE = re.compile(
+    r'(?is)<(?:tool_call|longcat_tool_call)>.*$'
+)
+
+
+def clean_for_display_text(text: str) -> str:
+    """Strip internal transport/protocol artifacts from user-visible display text."""
+    if not text:
+        return text or ""
+    cleaned = text.replace("[[audio_as_voice]]", "")
+    cleaned = _DISPLAY_MEDIA_RE.sub("", cleaned)
+    cleaned = _DISPLAY_PROTOCOL_LINE_RE.sub("", cleaned)
+    cleaned = _DISPLAY_TOOL_BLOCK_LINE_RE.sub("", cleaned)
+    cleaned = _DISPLAY_TOOL_BLOCK_INLINE_RE.sub(" ", cleaned)
+    cleaned = _DISPLAY_OPEN_TOOL_BLOCK_TO_END_RE.sub("", cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip("\n\r\t")
+
+
+
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
 
@@ -1231,6 +1262,11 @@ class BasePlatformAdapter(ABC):
         return media, cleaned
 
     @staticmethod
+    def clean_for_display(content: str) -> str:
+        """Strip internal directives / protocol artifacts before showing text to users."""
+        return clean_for_display_text(content)
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native media delivery.
@@ -1643,6 +1679,10 @@ class BasePlatformAdapter(ABC):
                 local_files, text_content = self.extract_local_files(text_content)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+
+                # Strip any remaining internal transport / malformed tool protocol
+                # debris before user-visible delivery.
+                text_content = self.clean_for_display(text_content)
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Skipped when the chat has voice mode disabled (/voice off)

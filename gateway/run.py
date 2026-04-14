@@ -24,6 +24,7 @@ import signal
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List
@@ -308,6 +309,47 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
     return resolved
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _StreamDeliveryFlags:
+    want_stream_deltas: bool
+    want_interim_messages: bool
+    want_interim_consumer: bool
+    effective_cursor: str
+
+
+def _resolve_stream_delivery_flags(
+    *,
+    adapter,
+    platform: Platform,
+    streaming_enabled: bool,
+    interim_messages_enabled: bool,
+    cursor: str,
+) -> _StreamDeliveryFlags:
+    want_stream_deltas = bool(streaming_enabled)
+    want_interim_messages = bool(interim_messages_enabled)
+    want_interim_consumer = want_interim_messages
+
+    adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True) if adapter else True
+    if not adapter_supports_edit:
+        return _StreamDeliveryFlags(
+            want_stream_deltas=False,
+            want_interim_messages=False,
+            want_interim_consumer=False,
+            effective_cursor="",
+        )
+
+    effective_cursor = cursor
+    if platform == Platform.MATRIX:
+        effective_cursor = ""
+
+    return _StreamDeliveryFlags(
+        want_stream_deltas=want_stream_deltas,
+        want_interim_messages=want_interim_messages,
+        want_interim_consumer=want_interim_consumer,
+        effective_cursor=effective_cursor,
+    )
 
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
@@ -7800,31 +7842,25 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
+            _adapter = self.adapters.get(source.platform)
+            _delivery_flags = _resolve_stream_delivery_flags(
+                adapter=_adapter,
+                platform=source.platform,
+                streaming_enabled=_streaming_enabled,
+                interim_messages_enabled=interim_assistant_messages_enabled,
+                cursor=_scfg.cursor,
+            )
+            _want_stream_deltas = _delivery_flags.want_stream_deltas
+            _want_interim_messages = _delivery_flags.want_interim_messages
+            _want_interim_consumer = _delivery_flags.want_interim_consumer
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                    _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. WeChat) must not show a cursor in intermediate
-                        # sends — the cursor would be permanently visible because
-                        # it can never be edited away.  Use an empty cursor for
-                        # such platforms so streaming still delivers the final
-                        # response, just without the typing indicator.
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
                         _consumer_cfg = StreamConsumerConfig(
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
+                            cursor=_delivery_flags.effective_cursor,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,

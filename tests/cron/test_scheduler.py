@@ -711,6 +711,40 @@ class TestRunJobSessionPersistence:
         # But the output log should show the placeholder
         assert "(No response generated)" in output
 
+    def test_run_job_legacy_empty_placeholder_is_normalized_for_delivery(self, tmp_path):
+        """Legacy '(empty)' placeholder must not leak into cron delivery."""
+        job = {
+            "id": "legacy-empty-job",
+            "name": "legacy empty test",
+            "prompt": "return nothing if there is no update",
+        }
+        fake_db = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "(empty)"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == ""
+        assert "(No response generated)" in output
+
     def test_run_job_sets_auto_delivery_env_from_dotenv_home_channel(self, tmp_path, monkeypatch):
         job = {
             "id": "test-job",
@@ -969,6 +1003,13 @@ class TestRunJobSkillBacked:
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
+    @pytest.fixture(autouse=True)
+    def _isolated_tick_lock(self, tmp_path):
+        lock_dir = tmp_path / "cron-locks"
+        lock_file = lock_dir / "cron.lock"
+        with patch("cron.scheduler._LOCK_DIR", lock_dir), patch("cron.scheduler._LOCK_FILE", lock_file):
+            yield
+
     def _make_job(self):
         return {
             "id": "monitor-job",
@@ -998,6 +1039,16 @@ class TestSilentDelivery:
                 tick(verbose=False)
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
+
+    def test_legacy_empty_placeholder_suppresses_delivery(self):
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", "(empty)", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_not_called()
 
     def test_silent_with_note_suppresses_delivery(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \

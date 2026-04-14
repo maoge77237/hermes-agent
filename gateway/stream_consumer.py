@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from gateway.platforms.base import clean_for_display_text
+
 logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
@@ -307,14 +309,7 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
-            return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
-        # Collapse excessive blank lines left behind by removed tags
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        # Strip trailing whitespace/newlines but preserve leading content
-        return cleaned.rstrip()
+        return clean_for_display_text(text)
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.

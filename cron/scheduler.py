@@ -54,6 +54,23 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+def _normalize_cron_final_response(content: Optional[str]) -> str:
+    """Normalize agent placeholders before cron delivery decisions.
+
+    Some agent paths use the legacy literal ``"(empty)"`` as a terminal
+    placeholder after exhausting empty-response retries. Cron jobs, however,
+    often intentionally require a truly empty final response to suppress
+    delivery (for example, "no new mail" watchers). Treat that legacy marker
+    as empty so it doesn't leak to user-facing channels.
+    """
+    if content is None:
+        return ""
+    text = str(content)
+    if text.strip() == "(empty)":
+        return ""
+    return text
+
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
 
@@ -827,7 +844,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"— last activity: {_last_desc}"
             )
 
-        final_response = result.get("final_response", "") or ""
+        final_response = _normalize_cron_final_response(
+            result.get("final_response", "") or ""
+        )
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -953,8 +972,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
-                deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
-                should_deliver = bool(deliver_content)
+                deliver_content = (
+                    _normalize_cron_final_response(final_response)
+                    if success
+                    else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                )
+                should_deliver = bool(deliver_content.strip())
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False

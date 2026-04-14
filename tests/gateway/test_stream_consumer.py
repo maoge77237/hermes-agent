@@ -84,6 +84,44 @@ class TestCleanForDisplay:
         # But "media:" is lowercase so won't match either
         assert result == text
 
+    def test_malformed_tool_protocol_line_is_stripped(self):
+        text = (
+            "Working on it...\n"
+            "to=multi_tool_use.parallel recipient_name=functions.terminal "
+            'parameters={"command":"pwd"} Need proper JSON.\n'
+            "Done."
+        )
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "Need proper JSON" not in result
+        assert "recipient_name=functions.terminal" not in result
+        assert result == "Working on it...\nDone."
+
+    def test_raw_tool_call_block_is_stripped(self):
+        text = 'Before\n<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>\nAfter'
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before\nAfter"
+
+    def test_inline_tool_call_block_preserves_surrounding_text(self):
+        text = 'Before <tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call> After'
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before After"
+
+    def test_unclosed_tool_call_block_is_stripped_to_end(self):
+        text = 'Before\n<tool_call>\n{"name":"terminal","arguments":{"command":"pwd"}}'
+        result = GatewayStreamConsumer._clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before"
+
+    def test_plain_json_status_is_preserved(self):
+        text = '{"summary":"ready","status":"ok"}'
+        assert GatewayStreamConsumer._clean_for_display(text) == text
+
+    def test_double_spaces_are_preserved_in_normal_text(self):
+        text = "Column A  Column B"
+        assert GatewayStreamConsumer._clean_for_display(text) == text
+
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 

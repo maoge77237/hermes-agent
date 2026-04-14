@@ -322,6 +322,53 @@ class TestExtractMedia:
         assert "After" in cleaned
 
 
+class TestCleanForDisplay:
+    def test_malformed_tool_protocol_line_is_stripped(self):
+        text = (
+            "Working on it...\n"
+            "to=multi_tool_use.parallel recipient_name=functions.terminal "
+            'parameters={"command":"pwd"} Need proper JSON.\n'
+            "Done."
+        )
+        result = BasePlatformAdapter.clean_for_display(text)
+        assert "Need proper JSON" not in result
+        assert "recipient_name=functions.terminal" not in result
+        assert result == "Working on it...\nDone."
+
+    def test_raw_tool_call_block_is_stripped(self):
+        text = 'Before\n<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>\nAfter'
+        result = BasePlatformAdapter.clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before\nAfter"
+
+    def test_inline_tool_call_block_preserves_surrounding_text(self):
+        text = 'Before <tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call> After'
+        result = BasePlatformAdapter.clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before After"
+
+    def test_unclosed_tool_call_block_is_stripped_to_end(self):
+        text = 'Before\n<tool_call>\n{"name":"terminal","arguments":{"command":"pwd"}}'
+        result = BasePlatformAdapter.clean_for_display(text)
+        assert "<tool_call>" not in result
+        assert result == "Before"
+
+    def test_plain_json_status_is_preserved(self):
+        text = '{"summary":"ready","status":"ok"}'
+        assert BasePlatformAdapter.clean_for_display(text) == text
+
+    def test_double_spaces_are_preserved_in_normal_text(self):
+        text = "Column A  Column B"
+        assert BasePlatformAdapter.clean_for_display(text) == text
+
+    def test_audio_and_media_directives_are_still_removed(self):
+        text = "[[audio_as_voice]]\nMEDIA:/tmp/voice.ogg\nDone"
+        result = BasePlatformAdapter.clean_for_display(text)
+        assert "[[audio_as_voice]]" not in result
+        assert "MEDIA:" not in result
+        assert result == "Done"
+
+
 # ---------------------------------------------------------------------------
 # truncate_message
 # ---------------------------------------------------------------------------

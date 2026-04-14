@@ -71,6 +71,7 @@ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_constants import get_hermes_home, display_hermes_home
+from gateway.platforms.base import clean_for_display_text
 from hermes_cli.env_loader import load_hermes_dotenv
 
 _hermes_home = get_hermes_home()
@@ -2528,6 +2529,43 @@ class HermesCLI:
                 self._stream_prefilt = self._stream_prefilt[-max_tag_len:]
             return
 
+    def _filter_stream_display_line(self, line: str) -> Optional[str]:
+        """Hide multiline raw tool-call blocks from the CLI stream display."""
+        if line == "":
+            return ""
+
+        lower = line.lower()
+        close_tags = ("</tool_call>", "</longcat_tool_call>")
+        if getattr(self, "_in_tool_protocol_block", False):
+            for close_tag in close_tags:
+                idx = lower.find(close_tag)
+                if idx != -1:
+                    self._in_tool_protocol_block = False
+                    remainder = line[idx + len(close_tag):]
+                    cleaned = clean_for_display_text(remainder)
+                    return cleaned if cleaned else None
+            return None
+
+        tag_pairs = (
+            ("<tool_call>", "</tool_call>"),
+            ("<longcat_tool_call>", "</longcat_tool_call>"),
+        )
+        for open_tag, close_tag in tag_pairs:
+            idx = lower.find(open_tag)
+            if idx == -1:
+                continue
+            end_idx = lower.find(close_tag, idx + len(open_tag))
+            if end_idx != -1:
+                kept = line[:idx] + line[end_idx + len(close_tag):]
+                cleaned = clean_for_display_text(kept)
+                return cleaned if cleaned else None
+            self._in_tool_protocol_block = True
+            prefix = clean_for_display_text(line[:idx])
+            return prefix if prefix else None
+
+        cleaned = clean_for_display_text(line)
+        return cleaned if cleaned else None
+
     def _emit_stream_text(self, text: str) -> None:
         """Emit filtered text to the streaming display."""
         if not text:
@@ -2577,7 +2615,13 @@ class HermesCLI:
         _tc = getattr(self, "_stream_text_ansi", "")
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
-            _cprint(f"{_tc}{line}{_RST}" if _tc else line)
+            line = self._filter_stream_display_line(line)
+            if line is None:
+                continue
+            if line == "":
+                _cprint("")
+            else:
+                _cprint(f"{_tc}{line}{_RST}" if _tc else line)
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -2593,8 +2637,13 @@ class HermesCLI:
         self._close_reasoning_box()
 
         if self._stream_buf:
-            _tc = getattr(self, "_stream_text_ansi", "")
-            _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+            line = self._filter_stream_display_line(self._stream_buf)
+            if line is not None:
+                _tc = getattr(self, "_stream_text_ansi", "")
+                if line == "":
+                    _cprint("")
+                else:
+                    _cprint(f"{_tc}{line}{_RST}" if _tc else line)
             self._stream_buf = ""
 
         # Close the response box
@@ -2610,6 +2659,7 @@ class HermesCLI:
         self._stream_text_ansi = ""
         self._stream_prefilt = ""
         self._in_reasoning_block = False
+        self._in_tool_protocol_block = False
         self._stream_last_was_newline = True
         self._reasoning_box_opened = False
         self._reasoning_buf = ""

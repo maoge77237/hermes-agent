@@ -40,6 +40,17 @@ def _make_cli_stub():
     return cli
 
 
+def _make_cli_display_stub():
+    """Create a stub that uses the real _emit_stream_text / _flush_stream methods."""
+    from cli import HermesCLI
+
+    cli = _make_cli_stub()
+    cli._emit_stream_text = HermesCLI._emit_stream_text.__get__(cli, HermesCLI)
+    cli._flush_stream = HermesCLI._flush_stream.__get__(cli, HermesCLI)
+    cli._close_reasoning_box = lambda: None
+    return cli
+
+
 class TestThinkTagInProse:
     """<think> mentioned in prose should NOT trigger reasoning suppression."""
 
@@ -110,6 +121,100 @@ class TestRealReasoningBlock:
         cli = _make_cli_stub()
         cli._stream_delta("   <think>")
         assert cli._in_reasoning_block
+
+
+class TestInternalProtocolSuppression:
+    def test_malformed_tool_protocol_line_is_suppressed(self):
+        cli = _make_cli_display_stub()
+        printed = []
+
+        from unittest.mock import patch
+        import shutil
+
+        with patch.object(shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with patch("cli._cprint", side_effect=lambda text: printed.append(text)):
+                cli._stream_delta(
+                    "Working on it...\n"
+                    "to=multi_tool_use.parallel recipient_name=functions.terminal "
+                    'parameters={"command":"pwd"} Need proper JSON.\n'
+                    "Done.\n"
+                )
+                cli._flush_stream()
+
+        full = "".join(line for line in printed if "╭" not in line and "╯" not in line)
+        assert "Need proper JSON" not in full
+        assert "recipient_name=functions.terminal" not in full
+        assert "Working on it..." in full
+        assert "Done." in full
+
+    def test_raw_tool_call_block_is_suppressed(self):
+        cli = _make_cli_display_stub()
+        printed = []
+
+        from unittest.mock import patch
+        import shutil
+
+        with patch.object(shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with patch("cli._cprint", side_effect=lambda text: printed.append(text)):
+                cli._stream_delta('Before\n<tool_call>{"name":"terminal","arguments":{"command":"pwd"}}</tool_call>\nAfter\n')
+                cli._flush_stream()
+
+        full = "".join(line for line in printed if "╭" not in line and "╯" not in line)
+        assert "<tool_call>" not in full
+        assert "Before" in full
+        assert "After" in full
+
+    def test_multiline_tool_call_block_is_suppressed(self):
+        cli = _make_cli_display_stub()
+        printed = []
+
+        from unittest.mock import patch
+        import shutil
+
+        with patch.object(shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with patch("cli._cprint", side_effect=lambda text: printed.append(text)):
+                cli._stream_delta("Before\n<tool_call>\n")
+                cli._stream_delta('{"name":"terminal","arguments":{"command":"pwd"}}\n')
+                cli._stream_delta("</tool_call>\nAfter\n")
+                cli._flush_stream()
+
+        full = "".join(line for line in printed if "╭" not in line and "╯" not in line)
+        assert "<tool_call>" not in full
+        assert '"name":"terminal"' not in full
+        assert "Before" in full
+        assert "After" in full
+
+    def test_plain_json_status_is_preserved(self):
+        cli = _make_cli_display_stub()
+        printed = []
+
+        from unittest.mock import patch
+        import shutil
+
+        with patch.object(shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with patch("cli._cprint", side_effect=lambda text: printed.append(text)):
+                cli._stream_delta('{"summary":"ready","status":"ok"}\n')
+                cli._flush_stream()
+
+        full = "".join(line for line in printed if "╭" not in line and "╯" not in line)
+        assert '{"summary":"ready","status":"ok"}' in full
+
+    def test_blank_line_in_normal_stream_is_preserved(self):
+        cli = _make_cli_display_stub()
+        printed = []
+
+        from unittest.mock import patch
+        import shutil
+
+        with patch.object(shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))):
+            with patch("cli._cprint", side_effect=lambda text: printed.append(text)):
+                cli._stream_delta("Line 1\n\nLine 2\n")
+                cli._flush_stream()
+
+        body = [line for line in printed if "╭" not in line and "╯" not in line]
+        assert body.count("") == 1
+        assert any("Line 1" in line for line in body)
+        assert any("Line 2" in line for line in body)
 
 
 class TestFlushRecovery:
