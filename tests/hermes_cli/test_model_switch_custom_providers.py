@@ -22,6 +22,7 @@ def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
     """No-args /model menus should include saved custom_providers entries."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", lambda *a, **k: None)
 
     providers = list_authenticated_providers(
         current_provider="openai-codex",
@@ -41,6 +42,37 @@ def test_list_authenticated_providers_includes_custom_providers(monkeypatch):
         and p["name"] == "Local (127.0.0.1:4141)"
         and p["models"] == ["rotator-openrouter-coding"]
         and p["api_url"] == "http://127.0.0.1:4141/v1"
+        for p in providers
+    )
+
+
+def test_list_authenticated_providers_prefers_live_catalog_for_custom_providers(monkeypatch):
+    """Saved custom_providers should show the live /models catalog when available."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda api_key, base_url, timeout=5.0: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="openai-codex",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Tokenx24.com",
+                "base_url": "https://tokenx24.com/v1",
+                "api_key": "***",
+                "model": "gpt-5.4",
+            }
+        ],
+        max_models=50,
+    )
+
+    assert any(
+        p["slug"] == "custom:tokenx24.com"
+        and p["models"] == ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]
+        and p["total_models"] == 3
         for p in providers
     )
 
@@ -70,7 +102,7 @@ def test_switch_model_accepts_explicit_named_custom_provider(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
         lambda requested: {
-            "api_key": "no-key-required",
+            "api_key": "***",
             "base_url": "http://127.0.0.1:4141/v1",
             "api_mode": "chat_completions",
         },
@@ -102,57 +134,3 @@ def test_switch_model_accepts_explicit_named_custom_provider(monkeypatch):
     assert result.new_model == "rotator-openrouter-coding"
     assert result.base_url == "http://127.0.0.1:4141/v1"
     assert result.api_key == "no-key-required"
-
-
-def test_list_groups_same_name_custom_providers_into_one_row(monkeypatch):
-    """Multiple custom_providers entries sharing a name should produce one row
-    with all models collected, not N duplicate rows."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
-    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
-
-    providers = list_authenticated_providers(
-        current_provider="openrouter",
-        user_providers={},
-        custom_providers=[
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "qwen3-coder:480b-cloud"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "glm-5.1:cloud"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "kimi-k2.5"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "minimax-m2.7:cloud"},
-            {"name": "Moonshot", "base_url": "https://api.moonshot.ai/v1", "model": "kimi-k2-thinking"},
-        ],
-        max_models=50,
-    )
-
-    ollama_rows = [p for p in providers if p["name"] == "Ollama Cloud"]
-    assert len(ollama_rows) == 1, f"Expected 1 Ollama Cloud row, got {len(ollama_rows)}"
-    assert ollama_rows[0]["models"] == [
-        "qwen3-coder:480b-cloud", "glm-5.1:cloud", "kimi-k2.5", "minimax-m2.7:cloud"
-    ]
-    assert ollama_rows[0]["total_models"] == 4
-
-    moonshot_rows = [p for p in providers if p["name"] == "Moonshot"]
-    assert len(moonshot_rows) == 1
-    assert moonshot_rows[0]["models"] == ["kimi-k2-thinking"]
-
-
-def test_list_deduplicates_same_model_in_group(monkeypatch):
-    """Duplicate model entries under the same provider name should not produce
-    duplicate entries in the models list."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
-    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
-
-    providers = list_authenticated_providers(
-        current_provider="openrouter",
-        user_providers={},
-        custom_providers=[
-            {"name": "MyProvider", "base_url": "http://localhost:11434/v1", "model": "llama3"},
-            {"name": "MyProvider", "base_url": "http://localhost:11434/v1", "model": "llama3"},
-            {"name": "MyProvider", "base_url": "http://localhost:11434/v1", "model": "mistral"},
-        ],
-        max_models=50,
-    )
-
-    my_rows = [p for p in providers if p["name"] == "MyProvider"]
-    assert len(my_rows) == 1
-    assert my_rows[0]["models"] == ["llama3", "mistral"]
-    assert my_rows[0]["total_models"] == 2

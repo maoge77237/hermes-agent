@@ -41,6 +41,7 @@ from agent.models_dev import (
     get_model_capabilities,
     get_model_info,
     list_provider_models,
+    search_models_dev,
 )
 
 logger = logging.getLogger(__name__)
@@ -934,65 +935,6 @@ def list_authenticated_providers(
         seen_slugs.add(pid)
         seen_slugs.add(hermes_slug)
 
-    # --- 2b. Cross-check canonical provider list ---
-    # Catches providers that are in CANONICAL_PROVIDERS but weren't found
-    # in PROVIDER_TO_MODELS_DEV or HERMES_OVERLAYS (keeps /model in sync
-    # with `hermes model`).
-    try:
-        from hermes_cli.models import CANONICAL_PROVIDERS as _canon_provs
-    except ImportError:
-        _canon_provs = []
-
-    for _cp in _canon_provs:
-        if _cp.slug in seen_slugs:
-            continue
-
-        # Check credentials via PROVIDER_REGISTRY (auth.py)
-        _cp_config = _auth_registry.get(_cp.slug)
-        _cp_has_creds = False
-        if _cp_config and _cp_config.api_key_env_vars:
-            _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
-        # Also check auth store and credential pool
-        if not _cp_has_creds:
-            try:
-                from hermes_cli.auth import _load_auth_store
-                _cp_store = _load_auth_store()
-                _cp_providers_store = _cp_store.get("providers", {})
-                _cp_pool_store = _cp_store.get("credential_pool", {})
-                if _cp_store and (
-                    _cp.slug in _cp_providers_store
-                    or _cp.slug in _cp_pool_store
-                ):
-                    _cp_has_creds = True
-            except Exception:
-                pass
-        if not _cp_has_creds:
-            try:
-                from agent.credential_pool import load_pool
-                _cp_pool = load_pool(_cp.slug)
-                if _cp_pool.has_credentials():
-                    _cp_has_creds = True
-            except Exception:
-                pass
-
-        if not _cp_has_creds:
-            continue
-
-        _cp_model_ids = curated.get(_cp.slug, [])
-        _cp_total = len(_cp_model_ids)
-        _cp_top = _cp_model_ids[:max_models]
-
-        results.append({
-            "slug": _cp.slug,
-            "name": _cp.label,
-            "is_current": _cp.slug == current_provider,
-            "is_user_defined": False,
-            "models": _cp_top,
-            "total_models": _cp_total,
-            "source": "canonical",
-        })
-        seen_slugs.add(_cp.slug)
-
     # --- 3. User-defined endpoints from config ---
     if user_providers and isinstance(user_providers, dict):
         for ep_name, ep_cfg in user_providers.items():
@@ -1027,17 +969,7 @@ def list_authenticated_providers(
             })
 
     # --- 4. Saved custom providers from config ---
-    # Each ``custom_providers`` entry represents one model under a named
-    # provider. Entries sharing the same provider name are grouped into a
-    # single picker row so that e.g. four Ollama Cloud entries
-    # (qwen3-coder, glm-5.1, kimi-k2, minimax-m2.7) appear as one
-    # "Ollama Cloud" row with four models inside instead of four
-    # duplicate "Ollama Cloud" rows. Entries with distinct provider names
-    # still produce separate rows (e.g. Ollama Cloud vs Moonshot).
     if custom_providers and isinstance(custom_providers, list):
-        from collections import OrderedDict
-
-        groups: "OrderedDict[str, dict]" = OrderedDict()
         for entry in custom_providers:
             if not isinstance(entry, dict):
                 continue
@@ -1053,28 +985,54 @@ def list_authenticated_providers(
                 continue
 
             slug = custom_provider_slug(display_name)
-            if slug not in groups:
-                groups[slug] = {
-                    "name": display_name,
-                    "api_url": api_url,
-                    "models": [],
-                }
-            default_model = (entry.get("model") or "").strip()
-            if default_model and default_model not in groups[slug]["models"]:
-                groups[slug]["models"].append(default_model)
-
-        for slug, grp in groups.items():
             if slug in seen_slugs:
                 continue
+
+            models_list = []
+            default_model = (entry.get("model") or "").strip()
+            if default_model:
+                models_list.append(default_model)
+
+            cfg_models = entry.get("models", [])
+            if isinstance(cfg_models, list):
+                for model_id in cfg_models:
+                    model_id = str(model_id or "").strip()
+                    if model_id and model_id not in models_list:
+                        models_list.append(model_id)
+            elif isinstance(cfg_models, dict):
+                for model_id in cfg_models.keys():
+                    model_id = str(model_id or "").strip()
+                    if model_id and model_id not in models_list:
+                        models_list.append(model_id)
+
+            try:
+                import os
+                from hermes_cli.models import fetch_api_models
+
+                api_key = (
+                    str(entry.get("api_key") or "").strip()
+                    or os.getenv("CUSTOM_API_KEY", "").strip()
+                    or os.getenv("OPENAI_API_KEY", "").strip()
+                    or os.getenv("OPENROUTER_API_KEY", "").strip()
+                )
+                live_models = fetch_api_models(api_key, api_url)
+                if live_models:
+                    models_list = list(dict.fromkeys(str(model_id).strip() for model_id in live_models if str(model_id).strip()))
+            except Exception:
+                pass
+
+            total = len(models_list)
+            top = models_list[:max_models]
+
             results.append({
                 "slug": slug,
-                "name": grp["name"],
+                "name": display_name,
                 "is_current": slug == current_provider,
                 "is_user_defined": True,
-                "models": grp["models"],
-                "total_models": len(grp["models"]),
+                "models": top,
+                "total_models": total,
                 "source": "user-config",
-                "api_url": grp["api_url"],
+                "api_url": api_url,
             })
             seen_slugs.add(slug)
 
@@ -1082,5 +1040,3 @@ def list_authenticated_providers(
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
 
     return results
-
-
