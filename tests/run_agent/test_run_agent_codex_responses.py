@@ -862,6 +862,32 @@ def test_interim_raw_tool_call_block_is_suppressed(monkeypatch):
     assert observed == []
 
 
+def test_build_assistant_message_blanks_internal_tool_protocol_content_on_tool_turn(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    assistant_message = SimpleNamespace(
+        content="俺也去 to=functions.terminal 期开奖结果 乱码?",
+        tool_calls=[
+            SimpleNamespace(
+                id="call_1",
+                call_id="call_1",
+                response_item_id="fc_1",
+                type="function",
+                function=SimpleNamespace(name="terminal", arguments="{}"),
+            )
+        ],
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=None,
+        codex_reasoning_items=None,
+    )
+
+    built = agent._build_assistant_message(assistant_message, "tool_calls")
+
+    assert built["content"] == ""
+    assert built["tool_calls"][0]["function"]["name"] == "terminal"
+
+
 def test_interim_plain_json_status_is_not_suppressed(monkeypatch):
     agent = _build_agent(monkeypatch)
     observed = []

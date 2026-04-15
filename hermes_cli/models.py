@@ -958,6 +958,19 @@ def _get_custom_base_url() -> str:
     return ""
 
 
+def _get_custom_api_key() -> str:
+    """Get the custom endpoint api_key from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        model_cfg = config.get("model", {})
+        if isinstance(model_cfg, dict):
+            return str(model_cfg.get("api_key", "")).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def curated_models_for_provider(
     provider: Optional[str],
     *,
@@ -1253,9 +1266,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     if normalized == "custom":
         base_url = _get_custom_base_url()
         if base_url:
-            # Try common API key env vars for custom endpoints
+            # Prefer an explicit custom env var, then config.yaml's model.api_key,
+            # then the generic OpenAI/OpenRouter env fallbacks.
             api_key = (
                 os.getenv("CUSTOM_API_KEY", "")
+                or _get_custom_api_key()
                 or os.getenv("OPENAI_API_KEY", "")
                 or os.getenv("OPENROUTER_API_KEY", "")
             )

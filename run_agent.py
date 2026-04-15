@@ -6528,9 +6528,25 @@ class AIAgent:
                 except Exception:
                     pass
 
+        assistant_content = assistant_message.content or ""
+        if assistant_message.tool_calls and assistant_content:
+            lowered_visible = self._strip_think_blocks(assistant_content).strip().lower()
+            tool_route_markers = (
+                "to=functions.",
+                "to=multi_tool_use.",
+                "recipient_name=functions.",
+                "recipient_name=multi_tool_use.",
+                '"recipient_name":"functions.',
+                '"recipient_name":"multi_tool_use.',
+            )
+            if self._looks_like_internal_tool_protocol_text(assistant_content) or any(
+                marker in lowered_visible for marker in tool_route_markers
+            ):
+                assistant_content = ""
+
         msg = {
             "role": "assistant",
-            "content": assistant_message.content or "",
+            "content": assistant_content,
             "reasoning": reasoning_text,
             "finish_reason": finish_reason,
         }

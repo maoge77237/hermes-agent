@@ -520,8 +520,52 @@ def load_cli_config() -> Dict[str, Any]:
 
     return defaults
 
+
+def _quick_commands_config_mtime() -> int | None:
+    """Return the current config.yaml mtime in ns, if available."""
+    try:
+        from hermes_cli.config import get_config_path as _get_config_path
+
+        return _get_config_path().stat().st_mtime_ns
+    except Exception:
+        return None
+
+
+
+def _load_live_quick_commands(fallback: Any = None) -> Dict[str, Any]:
+    """Return the latest quick_commands mapping from config.yaml when possible.
+
+    Running CLI sessions cache ``self.config`` at startup, which means newly-added
+    quick commands (for example /tk1, /tk2) can otherwise show up as "Unknown
+    command" until the whole CLI process is restarted. Prefer the live config on
+    disk after config.yaml actually changes, but preserve the in-memory mapping as
+    a fallback when the file is unchanged or reload fails.
+    """
+
+    quick_commands = dict(fallback) if isinstance(fallback, dict) else {}
+    current_mtime = _quick_commands_config_mtime()
+    if (
+        current_mtime is None
+        or _QUICK_COMMANDS_CONFIG_BASELINE_MTIME is None
+        or current_mtime == _QUICK_COMMANDS_CONFIG_BASELINE_MTIME
+    ):
+        return quick_commands
+    try:
+        from hermes_cli.config import load_config as _load_runtime_config
+
+        live_config = _load_runtime_config() or {}
+        if isinstance(live_config, dict):
+            live_quick_commands = live_config.get("quick_commands") or {}
+            if isinstance(live_quick_commands, dict):
+                return dict(live_quick_commands)
+            return {}
+    except Exception:
+        pass
+    return quick_commands
+
 # Load configuration at module startup
 CLI_CONFIG = load_cli_config()
+_QUICK_COMMANDS_CONFIG_BASELINE_MTIME = _quick_commands_config_mtime()
 
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
 # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
@@ -1986,6 +2030,74 @@ class HermesCLI:
         except Exception:
             return shutil.get_terminal_size(default).columns
 
+    @staticmethod
+    def _get_tui_terminal_lines(default: tuple[int, int] = (80, 24)) -> int:
+        """Return the live prompt_toolkit height, falling back to ``shutil``."""
+        try:
+            from prompt_toolkit.application import get_app
+            return get_app().output.get_size().rows
+        except Exception:
+            return shutil.get_terminal_size(default).lines
+
+    @classmethod
+    def _model_picker_visible_choices(
+        cls,
+        choices: list[str],
+        selected: int,
+        *,
+        term_lines: Optional[int] = None,
+    ) -> tuple[list[str], int, bool, bool]:
+        """Return the visible slice for the /model picker list.
+
+        The picker lives above the persistent input area, so rendering every
+        model in a tall provider list just gets clipped to the current viewport.
+        Keep a sliding window centered on the highlighted row so arrow-key
+        navigation actually reveals models beyond the first screenful.
+        """
+        total = len(choices)
+        if total <= 0:
+            return ([], 0, False, False)
+
+        selected = max(0, min(selected, total - 1))
+        lines = max(8, term_lines or cls._get_tui_terminal_lines())
+
+        # Reserve rows for panel chrome, input area, separators, and the footer.
+        # Then clamp to a sane range so large terminals don't create absurdly
+        # tall panels while tiny terminals still show a useful viewport.
+        max_visible = max(4, min(12, lines - 14))
+        if total <= max_visible:
+            return (list(choices), 0, False, False)
+
+        start = selected - (max_visible // 2)
+        start = max(0, min(start, total - max_visible))
+        end = start + max_visible
+        return (list(choices[start:end]), start, start > 0, end < total)
+
+    @classmethod
+    def _panel_box_width(
+        cls,
+        title: str,
+        content_lines: list[str],
+        min_width: int = 46,
+        max_width: int = 76,
+        *,
+        width: Optional[int] = None,
+    ) -> int:
+        """Choose a stable panel width using the live prompt_toolkit viewport.
+
+        Using ``shutil.get_terminal_size()`` while prompt_toolkit owns the TUI can
+        return stale or fallback dimensions, which then causes the rendered panel
+        to wrap again at a narrower real viewport and defeats item-based scrolling.
+        """
+        term_cols = width or cls._get_tui_terminal_width(default=(100, 20))
+        longest = max(
+            [cls._status_bar_display_width(title)]
+            + [cls._status_bar_display_width(line) for line in content_lines]
+            + [min_width - 4]
+        )
+        inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
+        return inner + 2  # account for the single leading/trailing spaces inside borders
+
     def _use_minimal_tui_chrome(self, width: Optional[int] = None) -> bool:
         """Hide low-value chrome on narrow/mobile terminals to preserve rows."""
         if width is None:
@@ -2780,9 +2892,24 @@ class HermesCLI:
         # `hermes chat --model <provider-name>` sends the provider name
         # (e.g. "my-provider") as the model string to the API instead of
         # the configured model (e.g. "qwen3.6-plus"), causing 400 errors.
-        runtime_model = runtime.get("model")
-        if runtime_model and isinstance(runtime_model, str):
-            self.model = runtime_model
+        #
+        # But once the user has explicitly switched to a real model via /model,
+        # do NOT clobber that session choice on the next turn by re-applying the
+        # provider's configured default model.
+        runtime_model = str(runtime.get("model") or "").strip()
+        if runtime_model:
+            current_model_norm = str(self.model or "").strip().lower()
+            requested_provider_norm = str(self.requested_provider or "").strip().lower()
+            resolved_provider_norm = str(resolved_provider or "").strip().lower()
+            provider_placeholders = {
+                requested_provider_norm,
+                resolved_provider_norm,
+            }
+            if requested_provider_norm.startswith("custom:"):
+                provider_placeholders.add(requested_provider_norm.split(":", 1)[1])
+
+            if not current_model_norm or current_model_norm in provider_placeholders:
+                self.model = runtime_model
 
         # If model is still empty (e.g. user ran `hermes auth add openai-codex`
         # without `hermes model`), fall back to the provider's first catalog
@@ -5569,9 +5696,17 @@ class HermesCLI:
         else:
             # Check for user-defined quick commands (bypass agent loop, no LLM call)
             base_cmd = cmd_lower.split()[0]
-            quick_commands = self.config.get("quick_commands", {})
+            quick_commands = _load_live_quick_commands(self.config.get("quick_commands", {}))
             if base_cmd.lstrip("/") in quick_commands:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
+                post_command = str(qcmd.get("post_command", "")).strip()
+                if post_command and not post_command.startswith("/"):
+                    post_command = f"/{post_command}"
+                if post_command and post_command.split()[0].lstrip("/") == base_cmd.lstrip("/"):
+                    self.console.print(
+                        f"[bold red]Quick command '{base_cmd}' cannot use itself as post_command[/]"
+                    )
+                    return True
                 if qcmd.get("type") == "exec":
                     import subprocess
                     exec_cmd = qcmd.get("command", "")
@@ -5586,6 +5721,8 @@ class HermesCLI:
                                 self.console.print(_rich_text_from_ansi(output))
                             else:
                                 self.console.print("[dim]Command returned no output[/]")
+                            if post_command:
+                                return self.process_command(post_command)
                         except subprocess.TimeoutExpired:
                             self.console.print("[bold red]Quick command timed out (30s)[/]")
                         except Exception as e:
@@ -5598,7 +5735,10 @@ class HermesCLI:
                         target = target if target.startswith("/") else f"/{target}"
                         user_args = cmd_original[len(base_cmd):].strip()
                         aliased_command = f"{target} {user_args}".strip()
-                        return self.process_command(aliased_command)
+                        result = self.process_command(aliased_command)
+                        if post_command:
+                            return self.process_command(post_command)
+                        return result
                     else:
                         self.console.print(f"[bold red]Quick command '{base_cmd}' has no target defined[/]")
                 else:
@@ -9084,10 +9224,12 @@ class HermesCLI:
 
         def _panel_box_width(title: str, content_lines: list[str], min_width: int = 46, max_width: int = 76) -> int:
             """Choose a stable panel width wide enough for the title and content."""
-            term_cols = shutil.get_terminal_size((100, 20)).columns
-            longest = max([len(title)] + [len(line) for line in content_lines] + [min_width - 4])
-            inner = min(max(longest + 4, min_width - 2), max_width - 2, max(24, term_cols - 6))
-            return inner + 2  # account for the single leading/trailing spaces inside borders
+            return cli_ref._panel_box_width(
+                title,
+                content_lines,
+                min_width=min_width,
+                max_width=max_width,
+            )
 
         def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "") -> list[str]:
             wrapped = textwrap.wrap(
@@ -9288,6 +9430,13 @@ class HermesCLI:
 
             box_width = _panel_box_width(title, [hint] + choices, min_width=46, max_width=84)
             inner_text_width = max(8, box_width - 6)
+            selected = state.get("selected", 0)
+            visible_choices, visible_offset, has_above, has_below = cli_ref._model_picker_visible_choices(
+                choices,
+                selected,
+            )
+            if len(visible_choices) < len(choices):
+                hint = f"{hint} — showing {visible_offset + 1}-{visible_offset + len(visible_choices)} of {len(choices)}"
             lines = []
             lines.append(('class:clarify-border', '╭─ '))
             lines.append(('class:clarify-title', title))
@@ -9295,12 +9444,21 @@ class HermesCLI:
             _append_blank_panel_line(lines, 'class:clarify-border', box_width)
             _append_panel_line(lines, 'class:clarify-border', 'class:clarify-hint', hint, box_width)
             _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-            selected = state.get("selected", 0)
-            for idx, choice in enumerate(choices):
+            if has_above:
+                above_count = visible_offset
+                more_above = f"↑ {above_count} more above"
+                for wrapped in _wrap_panel_text(more_above, inner_text_width, subsequent_indent='  '):
+                    _append_panel_line(lines, 'class:clarify-border', 'class:clarify-hint', wrapped, box_width)
+            for idx, choice in enumerate(visible_choices, start=visible_offset):
                 style = 'class:clarify-selected' if idx == selected else 'class:clarify-choice'
                 prefix = '❯ ' if idx == selected else '  '
                 for wrapped in _wrap_panel_text(prefix + choice, inner_text_width, subsequent_indent='  '):
                     _append_panel_line(lines, 'class:clarify-border', style, wrapped, box_width)
+            if has_below:
+                below_count = len(choices) - (visible_offset + len(visible_choices))
+                more_below = f"↓ {below_count} more below"
+                for wrapped in _wrap_panel_text(more_below, inner_text_width, subsequent_indent='  '):
+                    _append_panel_line(lines, 'class:clarify-border', 'class:clarify-hint', wrapped, box_width)
             _append_blank_panel_line(lines, 'class:clarify-border', box_width)
             lines.append(('class:clarify-border', '╰' + ('─' * box_width) + '╯\n'))
             return lines

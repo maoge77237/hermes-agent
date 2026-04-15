@@ -415,6 +415,51 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     return adapter.get_pending_message(session_key)
 
 
+def _quick_commands_config_mtime() -> int | None:
+    """Return the current config.yaml mtime in ns, if available."""
+    try:
+        from hermes_cli.config import get_config_path as _get_config_path
+
+        return _get_config_path().stat().st_mtime_ns
+    except Exception:
+        return None
+
+
+
+def _load_live_quick_commands(fallback: Any = None) -> dict[str, Any]:
+    """Return the latest quick_commands mapping from config.yaml when possible.
+
+    Gateway processes can stay alive while config.yaml changes under them. Reloading
+    quick commands lazily here lets newly added slash shortcuts like /tk1 and /tk2
+    start working immediately instead of pretending they never existed, while still
+    preserving the already-loaded mapping when the file is unchanged or reload fails.
+    """
+
+    quick_commands = dict(fallback) if isinstance(fallback, dict) else {}
+    current_mtime = _quick_commands_config_mtime()
+    if (
+        current_mtime is None
+        or _QUICK_COMMANDS_CONFIG_BASELINE_MTIME is None
+        or current_mtime == _QUICK_COMMANDS_CONFIG_BASELINE_MTIME
+    ):
+        return quick_commands
+    try:
+        from hermes_cli.config import load_config as _load_runtime_config
+
+        live_config = _load_runtime_config() or {}
+        if isinstance(live_config, dict):
+            live_quick_commands = live_config.get("quick_commands") or {}
+            if isinstance(live_quick_commands, dict):
+                return dict(live_quick_commands)
+            return {}
+    except Exception:
+        pass
+    return quick_commands
+
+
+_QUICK_COMMANDS_CONFIG_BASELINE_MTIME = _quick_commands_config_mtime()
+
+
 def _check_unavailable_skill(command_name: str) -> str | None:
     """Check if a command matches a known-but-inactive skill.
 
@@ -495,6 +540,20 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
+
+
+def _resolve_transcript_session_model(agent_result: dict | None = None) -> str:
+    """Return the model that should be written into fresh session metadata.
+
+    Prefer the actual runtime model from the just-finished agent turn. Falling
+    back to config.yaml makes transcripts/session previews look like /model
+    reverted even when the live run used the switched model.
+    """
+    if isinstance(agent_result, dict):
+        runtime_model = str(agent_result.get("model") or "").strip()
+        if runtime_model:
+            return runtime_model
+    return _resolve_gateway_model()
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -2832,10 +2891,16 @@ class GatewayRunner:
                 quick_commands = self.config.get("quick_commands", {}) or {}
             else:
                 quick_commands = getattr(self.config, "quick_commands", {}) or {}
+            quick_commands = _load_live_quick_commands(quick_commands)
             if not isinstance(quick_commands, dict):
                 quick_commands = {}
             if command in quick_commands:
                 qcmd = quick_commands[command]
+                post_command = str(qcmd.get("post_command", "")).strip()
+                if post_command and not post_command.startswith("/"):
+                    post_command = f"/{post_command}"
+                if post_command and post_command.split()[0].lstrip("/") == command:
+                    return f"Quick command '/{command}' cannot use itself as post_command."
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
@@ -2847,7 +2912,17 @@ class GatewayRunner:
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
                             output = (stdout or stderr).decode().strip()
-                            return output if output else "Command returned no output."
+                            output = output if output else "Command returned no output."
+                            if post_command:
+                                original_text = event.text
+                                event.text = post_command
+                                try:
+                                    follow_up = await self._handle_message(event)
+                                finally:
+                                    event.text = original_text
+                                if follow_up:
+                                    return f"{output}\n\n{follow_up}"
+                            return output
                         except asyncio.TimeoutError:
                             return "Quick command timed out (30s)."
                         except Exception as e:
@@ -2862,6 +2937,21 @@ class GatewayRunner:
                         user_args = event.get_command_args().strip()
                         event.text = f"{target} {user_args}".strip()
                         command = target_command
+                        if post_command:
+                            original_text = event.text
+                            try:
+                                follow_up = await self._handle_message(event)
+                            finally:
+                                event.text = original_text
+                            if follow_up:
+                                event.text = post_command
+                                try:
+                                    post_result = await self._handle_message(event)
+                                finally:
+                                    event.text = original_text
+                                if post_result:
+                                    return f"{follow_up}\n\n{post_result}"
+                                return follow_up
                         # Fall through to normal command dispatch below
                     else:
                         return f"Quick command '/{command}' has no target defined."
@@ -3759,7 +3849,7 @@ class GatewayRunner:
                     {
                         "role": "session_meta",
                         "tools": tool_defs or [],
-                        "model": _resolve_gateway_model(),
+                        "model": _resolve_transcript_session_model(agent_result),
                         "platform": source.platform.value if source.platform else "",
                         "timestamp": ts,
                     }

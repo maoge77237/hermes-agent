@@ -793,6 +793,44 @@ def list_authenticated_providers(
     if "nous" not in curated:
         curated["nous"] = curated["openrouter"]
 
+    def _merge_unique_models(*model_lists: list[str]) -> list[str]:
+        merged: list[str] = []
+        for models in model_lists:
+            if not isinstance(models, list):
+                continue
+            for model_id in models:
+                model_name = str(model_id or "").strip()
+                if model_name and model_name not in merged:
+                    merged.append(model_name)
+        return merged
+
+    def _custom_entry_config_models(entry: dict) -> list[str]:
+        configured: list[str] = []
+        default_model = str(entry.get("model") or "").strip()
+        if default_model:
+            configured.append(default_model)
+
+        raw_models = entry.get("models")
+        if isinstance(raw_models, list):
+            for item in raw_models:
+                model_name = str(item or "").strip()
+                if model_name and model_name not in configured:
+                    configured.append(model_name)
+        elif isinstance(raw_models, dict):
+            for key in raw_models.keys():
+                model_name = str(key or "").strip()
+                if model_name and model_name not in configured:
+                    configured.append(model_name)
+        return configured
+
+    def _resolve_custom_provider_models(entry: dict, api_url: str) -> list[str]:
+        from hermes_cli.models import fetch_api_models
+
+        configured = _custom_entry_config_models(entry)
+        api_key = str(entry.get("api_key") or "").strip()
+        live_models = fetch_api_models(api_key, api_url, timeout=8.0) if api_url else None
+        return _merge_unique_models(live_models or [], configured)
+
     # --- 1. Check Hermes-mapped providers ---
     for hermes_id, mdev_id in PROVIDER_TO_MODELS_DEV.items():
         pdata = data.get(mdev_id)
@@ -1059,9 +1097,10 @@ def list_authenticated_providers(
                     "api_url": api_url,
                     "models": [],
                 }
-            default_model = (entry.get("model") or "").strip()
-            if default_model and default_model not in groups[slug]["models"]:
-                groups[slug]["models"].append(default_model)
+            groups[slug]["models"] = _merge_unique_models(
+                groups[slug]["models"],
+                _resolve_custom_provider_models(entry, api_url),
+            )
 
         for slug, grp in groups.items():
             if slug in seen_slugs:

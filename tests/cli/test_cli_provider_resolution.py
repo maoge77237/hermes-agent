@@ -523,6 +523,69 @@ def test_codex_provider_strips_provider_prefix_from_model(monkeypatch):
     assert shell.model == "gpt-5.3-codex"
 
 
+def test_named_custom_provider_runtime_model_does_not_override_switched_session_model(monkeypatch):
+    """A named custom provider may expose a default model in runtime resolution,
+    but that must not overwrite a real model the user already switched to via
+    /model during this session."""
+    cli = _import_cli()
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://tokenx24.com/v1",
+            "api_key": "***",
+            "source": "custom_provider:Tokenx24.com",
+            "model": "gpt-5.4",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="gpt-5-2025-08-07", compact=True, max_turns=1)
+    shell.requested_provider = "custom:tokenx24.com"
+    shell.provider = "custom"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "https://tokenx24.com/v1"
+    shell.api_key = "same-key"
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.model == "gpt-5-2025-08-07"
+
+
+def test_named_custom_provider_runtime_model_replaces_provider_name_placeholder(monkeypatch):
+    """Keep the provider-name convenience behavior for custom providers.
+
+    If the current model string is really just the provider identifier the user
+    typed, runtime resolution should still promote the provider's configured
+    default model to the effective model name sent to the API.
+    """
+    cli = _import_cli()
+
+    def _runtime_resolve(**kwargs):
+        return {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://tokenx24.com/v1",
+            "api_key": "***",
+            "source": "custom_provider:Tokenx24.com",
+            "model": "gpt-5.4",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(model="Tokenx24.com", compact=True, max_turns=1)
+    shell.requested_provider = "custom:tokenx24.com"
+    shell.provider = "custom"
+    shell.api_mode = "chat_completions"
+    shell.base_url = "https://tokenx24.com/v1"
+    shell.api_key = "same-key"
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.model == "gpt-5.4"
+
+
 def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",

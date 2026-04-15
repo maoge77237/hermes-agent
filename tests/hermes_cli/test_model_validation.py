@@ -211,6 +211,15 @@ class TestProviderModelIds:
         assert "gpt-5.4" in ids
         assert "copilot-acp" not in ids
 
+    def test_custom_falls_back_to_config_api_key(self):
+        with patch("hermes_cli.models._get_custom_base_url", return_value="https://tokenx24.com/v1"), \
+             patch("hermes_cli.models._get_custom_api_key", return_value="config-key"), \
+             patch("hermes_cli.models.fetch_api_models", return_value=["gpt-5.4", "gpt-5.4-mini"]) as mock_fetch:
+            ids = provider_model_ids("custom")
+
+        assert ids == ["gpt-5.4", "gpt-5.4-mini"]
+        mock_fetch.assert_called_once_with("config-key", "https://tokenx24.com/v1")
+
 
 # -- fetch_api_models --------------------------------------------------------
 

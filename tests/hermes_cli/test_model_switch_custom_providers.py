@@ -109,16 +109,22 @@ def test_list_groups_same_name_custom_providers_into_one_row(monkeypatch):
     with all models collected, not N duplicate rows."""
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda api_key, base_url, timeout=8.0: [
+            "qwen3-coder:480b-cloud", "glm-5.1:cloud", "kimi-k2.5", "minimax-m2.7:cloud"
+        ] if "ollama.com" in base_url else ["kimi-k2-thinking"],
+    )
 
     providers = list_authenticated_providers(
         current_provider="openrouter",
         user_providers={},
         custom_providers=[
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "qwen3-coder:480b-cloud"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "glm-5.1:cloud"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "kimi-k2.5"},
-            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "minimax-m2.7:cloud"},
-            {"name": "Moonshot", "base_url": "https://api.moonshot.ai/v1", "model": "kimi-k2-thinking"},
+            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "qwen3-coder:480b-cloud", "api_key": "***"},
+            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "glm-5.1:cloud", "api_key": "***"},
+            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "kimi-k2.5", "api_key": "***"},
+            {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "minimax-m2.7:cloud", "api_key": "***"},
+            {"name": "Moonshot", "base_url": "https://api.moonshot.ai/v1", "model": "kimi-k2-thinking", "api_key": "***"},
         ],
         max_models=50,
     )
@@ -133,6 +139,37 @@ def test_list_groups_same_name_custom_providers_into_one_row(monkeypatch):
     moonshot_rows = [p for p in providers if p["name"] == "Moonshot"]
     assert len(moonshot_rows) == 1
     assert moonshot_rows[0]["models"] == ["kimi-k2-thinking"]
+
+
+def test_list_named_custom_provider_prefers_live_models_and_keeps_config_fallback(monkeypatch):
+    """Named custom providers should probe the live endpoint and merge any saved
+    config models so the picker shows the real catalog instead of only entry.model."""
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr(providers_mod, "HERMES_OVERLAYS", {})
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        lambda api_key, base_url, timeout=8.0: ["gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.4-mini"],
+    )
+
+    providers = list_authenticated_providers(
+        current_provider="custom",
+        user_providers={},
+        custom_providers=[
+            {
+                "name": "Tokenx24.com",
+                "base_url": "https://tokenx24.com/v1",
+                "api_key": "***",
+                "model": "gpt-5.4",
+                "models": {"gpt-5.4": {"context_length": 600000}, "gpt-5.4-nano": {"context_length": 600000}},
+            }
+        ],
+        max_models=50,
+    )
+
+    tokenx_rows = [p for p in providers if p["slug"] == "custom:tokenx24.com"]
+    assert len(tokenx_rows) == 1
+    assert tokenx_rows[0]["models"] == ["gpt-5.4", "gpt-5.4-2026-03-05", "gpt-5.4-mini", "gpt-5.4-nano"]
+    assert tokenx_rows[0]["total_models"] == 4
 
 
 def test_list_deduplicates_same_model_in_group(monkeypatch):
