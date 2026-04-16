@@ -218,10 +218,18 @@ class ResponseStore:
 
     def close(self) -> None:
         """Close the database connection."""
+        conn = getattr(self, "_conn", None)
+        if conn is None:
+            return
         try:
-            self._conn.close()
+            conn.close()
         except Exception:
             pass
+        self._conn = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for short-lived test/process instances."""
+        self.close()
 
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
@@ -503,6 +511,13 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    def _ensure_response_store(self) -> ResponseStore:
+        """Recreate the response store if a prior disconnect closed it."""
+        store = getattr(self, "_response_store", None)
+        if store is None or getattr(store, "_conn", None) is None:
+            self._response_store = ResponseStore()
+        return self._response_store
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -879,7 +894,10 @@ class APIServerAdapter(BasePlatformAdapter):
             loop = asyncio.get_event_loop()
             while True:
                 try:
-                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                    idle_for = time.monotonic() - last_activity
+                    keepalive_due_in = CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS - idle_for
+                    queue_timeout = min(0.5, max(0.01, keepalive_due_in))
+                    delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=queue_timeout))
                 except _q.Empty:
                     if agent_task.done():
                         # Drain any remaining items
@@ -1779,6 +1797,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
+            self._ensure_response_store()
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
@@ -1879,6 +1898,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        try:
+            self._response_store.close()
+        except Exception:
+            pass
+        if self._session_db is not None:
+            try:
+                self._session_db.close()
+            except Exception:
+                pass
+            self._session_db = None
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

@@ -12,9 +12,11 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import gc
 import json
 import time
 import uuid
+import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,6 +59,18 @@ class TestResponseStore:
         store = ResponseStore(max_size=10)
         store.put("resp_1", {"output": "hello"})
         assert store.get("resp_1") == {"output": "hello"}
+
+    def test_releases_sqlite_connection_on_gc(self, monkeypatch):
+        conn = MagicMock()
+        monkeypatch.setattr("gateway.platforms.api_server.sqlite3.connect", MagicMock(return_value=conn))
+
+        store = ResponseStore(max_size=10, db_path=":memory:")
+        ref = weakref.ref(store)
+        del store
+        gc.collect()
+
+        assert ref() is None
+        conn.close.assert_called_once()
 
     def test_get_missing_returns_none(self):
         store = ResponseStore(max_size=10)
@@ -117,6 +131,34 @@ class TestAdapterInit:
         assert adapter._port == 8642
         assert adapter._api_key == ""
         assert adapter.platform == Platform.API_SERVER
+
+    def test_ensure_response_store_reopens_closed_store(self):
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        old_store = adapter._response_store
+        old_store.close()
+
+        reopened = adapter._ensure_response_store()
+
+        assert reopened is adapter._response_store
+        assert reopened is not old_store
+        assert getattr(reopened, "_conn", None) is not None
+        reopened.put("resp_reopened", {"ok": True})
+        assert reopened.get("resp_reopened") == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_local_stores(self):
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        response_store = MagicMock()
+        session_db = MagicMock()
+        adapter._response_store = response_store
+        adapter._session_db = session_db
+
+        await adapter.disconnect()
+
+        response_store.close.assert_called_once_with()
+        session_db.close.assert_called_once_with()
 
     def test_custom_config_from_extra(self):
         config = PlatformConfig(
@@ -428,6 +470,44 @@ class TestChatCompletionsEndpoint:
                 if cb:
                     cb("Working")
                     await asyncio.sleep(0.65)
+                    cb("...done")
+                return (
+                    {"final_response": "Working...done", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with (
+                patch.object(api_server_mod, "CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS", 0.01),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "do the thing"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert ": keepalive" in body
+                assert "Working" in body
+                assert "...done" in body
+                assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_sends_keepalive_before_queue_poll_timeout(self, adapter):
+        """Keepalive cadence must respect the configured threshold, not the queue poll granularity."""
+        import asyncio
+        import gateway.platforms.api_server as api_server_mod
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Working")
+                    await asyncio.sleep(0.2)
                     cb("...done")
                 return (
                     {"final_response": "Working...done", "messages": [], "api_calls": 1},

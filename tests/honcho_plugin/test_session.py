@@ -203,43 +203,47 @@ class TestPeerLookupHelpers:
         mgr._cache[session.key] = session
         return mgr, session
 
-    def test_get_peer_card_uses_direct_peer_lookup(self):
+    def test_get_peer_card_uses_observer_target_lookup_when_ai_can_observe_others(self):
         mgr, session = self._make_cached_manager()
-        user_peer = MagicMock()
-        user_peer.get_card.return_value = ["Name: Robert"]
-        mgr._get_or_create_peer = MagicMock(return_value=user_peer)
+        assistant_peer = MagicMock()
+        assistant_peer.get_card.return_value = ["Name: Robert"]
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         assert mgr.get_peer_card(session.key) == ["Name: Robert"]
-        user_peer.get_card.assert_called_once_with()
+        assistant_peer.get_card.assert_called_once_with(target=session.user_peer_id)
 
-    def test_search_context_uses_peer_context_response(self):
+    def test_search_context_uses_observer_target_context_response(self):
         mgr, session = self._make_cached_manager()
-        user_peer = MagicMock()
-        user_peer.context.return_value = SimpleNamespace(
+        assistant_peer = MagicMock()
+        assistant_peer.context.return_value = SimpleNamespace(
             representation="Robert runs neuralancer",
             peer_card=["Location: Melbourne"],
         )
-        mgr._get_or_create_peer = MagicMock(return_value=user_peer)
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         result = mgr.search_context(session.key, "neuralancer")
 
         assert "Robert runs neuralancer" in result
         assert "- Location: Melbourne" in result
-        user_peer.context.assert_called_once_with(search_query="neuralancer")
+        assistant_peer.context.assert_called_once_with(
+            target=session.user_peer_id,
+            search_query="neuralancer",
+        )
 
-    def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
+    def test_get_prefetch_context_fetches_user_from_observer_target_api(self):
         mgr, session = self._make_cached_manager()
-        user_peer = MagicMock()
-        user_peer.context.return_value = SimpleNamespace(
-            representation="User representation",
-            peer_card=["Name: Robert"],
-        )
-        ai_peer = MagicMock()
-        ai_peer.context.return_value = SimpleNamespace(
-            representation="AI representation",
-            peer_card=["Owner: Robert"],
-        )
-        mgr._get_or_create_peer = MagicMock(side_effect=[user_peer, ai_peer])
+        assistant_peer = MagicMock()
+        assistant_peer.context.side_effect = [
+            SimpleNamespace(
+                representation="User representation",
+                peer_card=["Name: Robert"],
+            ),
+            SimpleNamespace(
+                representation="AI representation",
+                peer_card=["Owner: Robert"],
+            ),
+        ]
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
 
         result = mgr.get_prefetch_context(session.key)
 
@@ -249,8 +253,201 @@ class TestPeerLookupHelpers:
             "ai_representation": "AI representation",
             "ai_card": "Owner: Robert",
         }
+        assert assistant_peer.context.call_args_list[0].kwargs == {
+            "target": session.user_peer_id,
+        }
+        assert assistant_peer.context.call_args_list[1].kwargs == {}
+
+    def test_get_prefetch_context_backfills_missing_user_card_from_direct_context(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.context.return_value = SimpleNamespace(
+            representation="",
+            peer_card=["Direct card"],
+        )
+        assistant_peer = MagicMock()
+        assistant_peer.context.side_effect = [
+            SimpleNamespace(
+                representation="Observer representation",
+                peer_card=None,
+            ),
+            SimpleNamespace(
+                representation="AI representation",
+                peer_card=["Owner: Robert"],
+            ),
+        ]
+        assistant_peer.get_card.return_value = None
+        assistant_peer.card = None
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        result = mgr.get_prefetch_context(session.key)
+
+        assert result == {
+            "representation": "Observer representation",
+            "card": "Direct card",
+            "ai_representation": "AI representation",
+            "ai_card": "Owner: Robert",
+        }
+        assistant_peer.context.assert_any_call(target=session.user_peer_id)
         user_peer.context.assert_called_once_with()
-        ai_peer.context.assert_called_once_with()
+
+    def test_get_peer_card_falls_back_to_direct_user_card_when_observer_card_empty(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.get_card.return_value = ["Name: Robert"]
+        assistant_peer = MagicMock()
+        assistant_peer.get_card.return_value = None
+        assistant_peer.card = None
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        assert mgr.get_peer_card(session.key) == ["Name: Robert"]
+        assistant_peer.get_card.assert_called_once_with(target=session.user_peer_id)
+        user_peer.get_card.assert_called_once_with()
+
+    def test_get_peer_card_falls_back_to_direct_user_card_when_observer_lookup_errors(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.get_card.return_value = ["Name: Robert"]
+        assistant_peer = MagicMock()
+        assistant_peer.get_card.side_effect = TypeError("unexpected keyword argument target")
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        assert mgr.get_peer_card(session.key) == ["Name: Robert"]
+        assistant_peer.get_card.assert_called_once_with(target=session.user_peer_id)
+        user_peer.get_card.assert_called_once_with()
+
+    def test_get_peer_card_falls_back_to_conclusions_when_card_empty(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.get_card.return_value = None
+        user_peer.card = None
+        assistant_peer = MagicMock()
+        assistant_peer.get_card.return_value = None
+        assistant_peer.card = None
+        conclusions_scope = MagicMock()
+        conclusions_scope.list.return_value = [
+            SimpleNamespace(content="User prefers VS Code."),
+            SimpleNamespace(content="User oversees operations."),
+        ]
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        assert mgr.get_peer_card(session.key) == [
+            "User prefers VS Code.",
+            "User oversees operations.",
+        ]
+        assistant_peer.conclusions_of.assert_called_once_with(session.user_peer_id)
+        conclusions_scope.list.assert_called_once_with(size=10, reverse=True)
+
+    def test_search_context_falls_back_to_direct_user_context_when_observer_context_empty(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.context.return_value = SimpleNamespace(
+            representation="Direct user representation",
+            peer_card=["Location: Melbourne"],
+        )
+        assistant_peer = MagicMock()
+        assistant_peer.context.return_value = SimpleNamespace(representation="", peer_card=None)
+        assistant_peer.representation.return_value = ""
+        assistant_peer.get_card.return_value = None
+        assistant_peer.card = None
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        result = mgr.search_context(session.key, "neuralancer")
+
+        assert result == "Direct user representation\n\n- Location: Melbourne"
+        assistant_peer.context.assert_called_once_with(
+            target=session.user_peer_id,
+            search_query="neuralancer",
+        )
+        user_peer.context.assert_called_once_with(search_query="neuralancer")
+
+    def test_search_context_backfills_missing_representation_from_direct_user_context(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.context.return_value = SimpleNamespace(
+            representation="Direct user representation",
+            peer_card=None,
+        )
+        assistant_peer = MagicMock()
+        assistant_peer.context.return_value = SimpleNamespace(
+            representation="",
+            peer_card=["Observer fact"],
+        )
+        assistant_peer.representation.return_value = ""
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        result = mgr.search_context(session.key, "neuralancer")
+
+        assert result == "Direct user representation\n\n- Observer fact"
+        assistant_peer.context.assert_called_once_with(
+            target=session.user_peer_id,
+            search_query="neuralancer",
+        )
+        user_peer.context.assert_called_once_with(search_query="neuralancer")
+
+    def test_search_context_falls_back_to_conclusions_representation_when_peer_context_empty(self):
+        mgr, session = self._make_cached_manager()
+        user_peer = MagicMock()
+        user_peer.context.return_value = SimpleNamespace(representation="", peer_card=None)
+        user_peer.representation.return_value = ""
+        user_peer.get_card.return_value = None
+        user_peer.card = None
+        assistant_peer = MagicMock()
+        assistant_peer.context.return_value = SimpleNamespace(representation="", peer_card=None)
+        assistant_peer.representation.return_value = ""
+        assistant_peer.get_card.return_value = None
+        assistant_peer.card = None
+        conclusions_scope = MagicMock()
+        conclusions_scope.representation.return_value = "Known facts from conclusions"
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: {
+                session.user_peer_id: user_peer,
+                session.assistant_peer_id: assistant_peer,
+            }[peer_id]
+        )
+
+        result = mgr.search_context(session.key, "neuralancer")
+
+        assert result == "Known facts from conclusions"
+        assistant_peer.context.assert_called_once_with(
+            target=session.user_peer_id,
+            search_query="neuralancer",
+        )
+        user_peer.context.assert_called_once_with(search_query="neuralancer")
+        assistant_peer.conclusions_of.assert_called_once_with(session.user_peer_id)
+        conclusions_scope.representation.assert_called_once_with(search_query="neuralancer")
 
     def test_get_ai_representation_uses_peer_api(self):
         mgr, session = self._make_cached_manager()
@@ -426,7 +623,18 @@ class TestChunkMessage:
 
 
 class TestDialecticInputGuard:
-    def test_long_query_truncated(self):
+    def test_fill_missing_context_fields_normalizes_string_card_values(self):
+        result = HonchoSessionManager._fill_missing_context_fields(
+            {"representation": "", "card": "Direct card"},
+            {"representation": "Fallback representation", "card": ["Fallback card"]},
+        )
+
+        assert result == {
+            "representation": "Fallback representation",
+            "card": ["Direct card"],
+        }
+
+    def test_query_is_truncated_before_honcho_call(self):
         """Queries exceeding dialectic_max_input_chars are truncated."""
         from plugins.memory.honcho.client import HonchoClientConfig
 
@@ -452,3 +660,107 @@ class TestDialecticInputGuard:
         # The query passed to chat() should be truncated
         actual_query = mock_peer.chat.call_args[0][0]
         assert len(actual_query) <= 100
+
+    def test_dialectic_query_falls_back_to_conclusions_representation_on_chat_error(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        mgr._cache["test"] = session
+
+        assistant_peer = MagicMock()
+        assistant_peer.chat.side_effect = RuntimeError("boom")
+        conclusions_scope = MagicMock()
+        conclusions_scope.representation.return_value = "Fallback answer from conclusions"
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+
+        result = mgr.dialectic_query("test", "Who is this user?")
+
+        assert result == "Fallback answer from conclusions"
+        assistant_peer.conclusions_of.assert_called_once_with(session.user_peer_id)
+        conclusions_scope.representation.assert_called_once_with(search_query="Who is this user?")
+
+    def test_dialectic_query_truncation_keeps_chat_result_within_limit(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(dialectic_max_chars=20)
+        mgr = HonchoSessionManager(config=cfg)
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        mgr._cache["test"] = session
+
+        assistant_peer = MagicMock()
+        assistant_peer.chat.return_value = "x" * 25
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+
+        result = mgr.dialectic_query("test", "Who is this user?")
+
+        assert len(result) <= 20
+        assert result.endswith("…")
+        assert result.startswith("x")
+
+    def test_dialectic_query_truncation_keeps_fallback_result_within_limit(self):
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(dialectic_max_chars=20)
+        mgr = HonchoSessionManager(config=cfg)
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        mgr._cache["test"] = session
+
+        assistant_peer = MagicMock()
+        assistant_peer.chat.side_effect = RuntimeError("boom")
+        conclusions_scope = MagicMock()
+        conclusions_scope.representation.return_value = "y" * 25
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+
+        result = mgr.dialectic_query("test", "Who is this user?")
+
+        assert len(result) <= 20
+        assert result.endswith("…")
+        assert result.startswith("y")
+
+    def test_fallback_conclusion_context_omits_search_query_when_query_absent(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        assistant_peer = MagicMock()
+        conclusions_scope = MagicMock()
+        conclusions_scope.representation.return_value = "Fallback answer from conclusions"
+        conclusions_scope.list.return_value = []
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+
+        result = mgr._fallback_conclusion_context(session)
+
+        assert result == {"representation": "Fallback answer from conclusions", "card": []}
+        conclusions_scope.representation.assert_called_once_with()
+
+    def test_fallback_conclusion_context_uses_list_when_query_lookup_errors(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="test", user_peer_id="u", assistant_peer_id="a",
+            honcho_session_id="s",
+        )
+        assistant_peer = MagicMock()
+        conclusions_scope = MagicMock()
+        conclusions_scope.representation.return_value = ""
+        conclusions_scope.query.side_effect = TypeError("query unsupported")
+        conclusions_scope.list.return_value = [SimpleNamespace(content="Fact from list")]
+        assistant_peer.conclusions_of.return_value = conclusions_scope
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+
+        result = mgr._fallback_conclusion_context(session, query="who")
+
+        assert result == {"representation": "", "card": ["Fact from list"]}
+        conclusions_scope.query.assert_called_once_with("who", top_k=10)
+        conclusions_scope.list.assert_called_once_with(size=10, reverse=True)
