@@ -544,8 +544,7 @@ class HonchoSessionManager:
             return ""
 
         # Guard: truncate query to Honcho's dialectic input limit
-        if len(query) > self._dialectic_max_input_chars:
-            query = query[:self._dialectic_max_input_chars].rsplit(" ", 1)[0]
+        query = self._truncate_text(query, self._dialectic_max_input_chars)
 
         level = reasoning_level or self._dynamic_reasoning_level(query)
 
@@ -567,14 +566,23 @@ class HonchoSessionManager:
                 peer_id = session.assistant_peer_id if peer == "ai" else session.user_peer_id
                 target_peer = self._get_or_create_peer(peer_id)
                 result = target_peer.chat(query, reasoning_level=level) or ""
-
-            # Apply Hermes-side char cap before caching
-            if result and self._dialectic_max_chars and len(result) > self._dialectic_max_chars:
-                result = result[:self._dialectic_max_chars].rsplit(" ", 1)[0] + " …"
-            return result
         except Exception as e:
             logger.warning("Honcho dialectic query failed: %s", e)
-            return ""
+            result = ""
+
+        if not result and peer != "ai":
+            fallback = self._fallback_conclusion_context(
+                session,
+                query=query,
+                target_peer_id=session.user_peer_id,
+            )
+            result = fallback["representation"]
+            if not result and fallback["card"]:
+                result = "\n".join(f"- {fact}" for fact in fallback["card"])
+
+        # Apply Hermes-side char cap before caching
+        result = self._truncate_text(result, self._dialectic_max_chars, suffix=" …")
+        return result
 
     def prefetch_dialectic(self, session_key: str, query: str) -> None:
         """
@@ -666,7 +674,25 @@ class HonchoSessionManager:
 
         result: dict[str, str] = {}
         try:
-            user_ctx = self._fetch_peer_context(session.user_peer_id)
+            user_ctx = {"representation": "", "card": []}
+            if self._ai_observe_others:
+                user_ctx = self._fetch_peer_context(
+                    session.assistant_peer_id,
+                    target_peer_id=session.user_peer_id,
+                )
+            if not user_ctx["representation"] or not user_ctx["card"]:
+                user_ctx = self._fill_missing_context_fields(
+                    user_ctx,
+                    self._fetch_peer_context(session.user_peer_id),
+                )
+            if not user_ctx["representation"] or not user_ctx["card"]:
+                user_ctx = self._fill_missing_context_fields(
+                    user_ctx,
+                    self._fallback_conclusion_context(
+                        session,
+                        target_peer_id=session.user_peer_id,
+                    ),
+                )
             result["representation"] = user_ctx["representation"]
             result["card"] = "\n".join(user_ctx["card"])
         except Exception as e:
@@ -862,7 +888,119 @@ class HonchoSessionManager:
             return [str(item) for item in card if item]
         return [str(card)]
 
-    def _fetch_peer_card(self, peer_id: str) -> list[str]:
+    @staticmethod
+    def _normalize_conclusions(items: Any) -> list[str]:
+        """Normalize Honcho Conclusion objects into plain strings."""
+        if not items:
+            return []
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            content = getattr(item, "content", None)
+            text = str(content or item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    @staticmethod
+    def _fill_missing_context_fields(
+        primary: dict[str, Any] | None,
+        fallback: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Fill missing representation/card fields without clobbering richer data."""
+        primary = primary or {}
+        fallback = fallback or {}
+        representation = str(primary.get("representation") or "")
+        card = HonchoSessionManager._normalize_card(primary.get("card"))
+        if not representation:
+            representation = str(fallback.get("representation") or "")
+        if not card:
+            card = HonchoSessionManager._normalize_card(fallback.get("card"))
+        return {"representation": representation, "card": card}
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int, *, suffix: str = "") -> str:
+        """Truncate text to ``limit`` chars, keeping any suffix inside the cap."""
+        if not text or limit <= 0 or len(text) <= limit:
+            return text
+
+        suffix = suffix or ""
+        ellipsis = suffix.lstrip() or suffix
+        if suffix and limit <= len(suffix):
+            return ellipsis[:limit]
+
+        budget = limit - len(suffix)
+        truncated = text[:budget].rstrip()
+        if not truncated:
+            truncated = text[:budget]
+
+        if truncated and " " in truncated:
+            candidate = truncated.rsplit(" ", 1)[0].rstrip()
+            if candidate:
+                truncated = candidate
+
+        return truncated + suffix
+
+    def _get_conclusions_scope(self, session: HonchoSession, target_peer_id: str | None = None) -> Any | None:
+        """Return the best available conclusions scope for the target peer."""
+        target_id = target_peer_id or session.user_peer_id
+        observer_peer_id = (
+            session.assistant_peer_id if self._ai_observe_others else target_id
+        )
+        try:
+            observer_peer = self._get_or_create_peer(observer_peer_id)
+            return observer_peer.conclusions_of(target_id)
+        except Exception as e:
+            logger.debug(
+                "Failed to access conclusions scope for observer '%s' target '%s': %s",
+                observer_peer_id,
+                target_id,
+                e,
+            )
+            return None
+
+    def _fallback_conclusion_context(
+        self,
+        session: HonchoSession,
+        query: str | None = None,
+        *,
+        target_peer_id: str | None = None,
+        max_items: int = 10,
+    ) -> dict[str, Any]:
+        """Build a representation/card fallback from Honcho conclusions."""
+        scope = self._get_conclusions_scope(session, target_peer_id=target_peer_id)
+        if not scope:
+            return {"representation": "", "card": []}
+
+        representation = ""
+        try:
+            rep_kwargs: dict[str, Any] = {}
+            if query is not None:
+                rep_kwargs["search_query"] = query
+            representation = (scope.representation(**rep_kwargs) or "").strip()
+        except Exception as e:
+            logger.debug("Conclusion representation fallback failed: %s", e)
+
+        card: list[str] = []
+        if query:
+            try:
+                card = self._normalize_conclusions(scope.query(query, top_k=max_items))
+            except Exception as e:
+                logger.debug("Conclusion fact query fallback failed: %s", e)
+        if not card:
+            try:
+                card = self._normalize_conclusions(
+                    scope.list(size=max_items, reverse=True)
+                )
+            except Exception as e:
+                logger.debug("Conclusion fact list fallback failed: %s", e)
+
+        return {"representation": representation, "card": card}
+
+    def _fetch_peer_card(self, peer_id: str, target_peer_id: str | None = None) -> list[str]:
         """Fetch a peer card directly from the peer object.
 
         This avoids relying on session.context(), which can return an empty
@@ -872,22 +1010,37 @@ class HonchoSessionManager:
         peer = self._get_or_create_peer(peer_id)
         getter = getattr(peer, "get_card", None)
         if callable(getter):
+            if target_peer_id is not None:
+                return self._normalize_card(getter(target=target_peer_id))
             return self._normalize_card(getter())
 
         legacy_getter = getattr(peer, "card", None)
         if callable(legacy_getter):
+            if target_peer_id is not None:
+                return self._normalize_card(legacy_getter(target=target_peer_id))
             return self._normalize_card(legacy_getter())
 
         return []
 
-    def _fetch_peer_context(self, peer_id: str, search_query: str | None = None) -> dict[str, Any]:
+    def _fetch_peer_context(
+        self,
+        peer_id: str,
+        search_query: str | None = None,
+        target_peer_id: str | None = None,
+    ) -> dict[str, Any]:
         """Fetch representation + peer card directly from a peer object."""
         peer = self._get_or_create_peer(peer_id)
         representation = ""
         card: list[str] = []
 
+        context_kwargs: dict[str, Any] = {}
+        if target_peer_id is not None:
+            context_kwargs["target"] = target_peer_id
+        if search_query is not None:
+            context_kwargs["search_query"] = search_query
+
         try:
-            ctx = peer.context(search_query=search_query) if search_query else peer.context()
+            ctx = peer.context(**context_kwargs)
             representation = (
                 getattr(ctx, "representation", None)
                 or getattr(ctx, "peer_representation", None)
@@ -895,19 +1048,41 @@ class HonchoSessionManager:
             )
             card = self._normalize_card(getattr(ctx, "peer_card", None))
         except Exception as e:
-            logger.debug("Direct peer.context() failed for '%s': %s", peer_id, e)
+            logger.debug(
+                "Direct peer.context() failed for '%s' target '%s': %s",
+                peer_id,
+                target_peer_id,
+                e,
+            )
 
         if not representation:
             try:
-                representation = peer.representation() or ""
+                rep_getter = getattr(peer, "representation", None)
+                if callable(rep_getter):
+                    rep_kwargs: dict[str, Any] = {}
+                    if target_peer_id is not None:
+                        rep_kwargs["target"] = target_peer_id
+                    if search_query is not None:
+                        rep_kwargs["search_query"] = search_query
+                    representation = rep_getter(**rep_kwargs) or ""
             except Exception as e:
-                logger.debug("Direct peer.representation() failed for '%s': %s", peer_id, e)
+                logger.debug(
+                    "Direct peer.representation() failed for '%s' target '%s': %s",
+                    peer_id,
+                    target_peer_id,
+                    e,
+                )
 
         if not card:
             try:
-                card = self._fetch_peer_card(peer_id)
+                card = self._fetch_peer_card(peer_id, target_peer_id=target_peer_id)
             except Exception as e:
-                logger.debug("Direct peer card fetch failed for '%s': %s", peer_id, e)
+                logger.debug(
+                    "Direct peer card fetch failed for '%s' target '%s': %s",
+                    peer_id,
+                    target_peer_id,
+                    e,
+                )
 
         return {"representation": representation, "card": card}
 
@@ -924,10 +1099,25 @@ class HonchoSessionManager:
             return []
 
         try:
-            return self._fetch_peer_card(session.user_peer_id)
+            card: list[str] = []
+            if self._ai_observe_others:
+                try:
+                    card = self._fetch_peer_card(
+                        session.assistant_peer_id,
+                        target_peer_id=session.user_peer_id,
+                    )
+                except Exception as e:
+                    logger.debug("Observer-target peer card lookup failed: %s", e)
+                    card = []
+            if not card:
+                card = self._fetch_peer_card(session.user_peer_id)
+            if card:
+                return card
         except Exception as e:
             logger.debug("Failed to fetch peer card from Honcho: %s", e)
-            return []
+
+        fallback = self._fallback_conclusion_context(session, target_peer_id=session.user_peer_id)
+        return fallback["card"]
 
     def search_context(self, session_key: str, query: str, max_tokens: int = 800) -> str:
         """
@@ -950,17 +1140,50 @@ class HonchoSessionManager:
             return ""
 
         try:
-            ctx = self._fetch_peer_context(session.user_peer_id, search_query=query)
+            ctx = {"representation": "", "card": []}
+            if self._ai_observe_others:
+                ctx = self._fetch_peer_context(
+                    session.assistant_peer_id,
+                    search_query=query,
+                    target_peer_id=session.user_peer_id,
+                )
+            if not ctx["representation"] or not ctx["card"]:
+                ctx = self._fill_missing_context_fields(
+                    ctx,
+                    self._fetch_peer_context(session.user_peer_id, search_query=query),
+                )
+            if not ctx["representation"] or not ctx["card"]:
+                ctx = self._fill_missing_context_fields(
+                    ctx,
+                    self._fallback_conclusion_context(
+                        session,
+                        query=query,
+                        target_peer_id=session.user_peer_id,
+                    ),
+                )
             parts = []
             if ctx["representation"]:
                 parts.append(ctx["representation"])
             card = ctx["card"] or []
             if card:
                 parts.append("\n".join(f"- {f}" for f in card))
-            return "\n\n".join(parts)
+            result = "\n\n".join(parts)
+            if result:
+                return result
         except Exception as e:
             logger.debug("Honcho search_context failed: %s", e)
-            return ""
+
+        fallback = self._fallback_conclusion_context(
+            session,
+            query=query,
+            target_peer_id=session.user_peer_id,
+        )
+        parts = []
+        if fallback["representation"]:
+            parts.append(fallback["representation"])
+        if fallback["card"]:
+            parts.append("\n".join(f"- {f}" for f in fallback["card"]))
+        return "\n\n".join(parts)
 
     def create_conclusion(self, session_key: str, content: str) -> bool:
         """Write a conclusion about the user back to Honcho.
