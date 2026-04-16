@@ -218,10 +218,18 @@ class ResponseStore:
 
     def close(self) -> None:
         """Close the database connection."""
+        conn = getattr(self, "_conn", None)
+        if conn is None:
+            return
         try:
-            self._conn.close()
+            conn.close()
         except Exception:
             pass
+        self._conn = None
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for short-lived test/process instances."""
+        self.close()
 
     def __len__(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
@@ -1879,6 +1887,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
+        try:
+            self._response_store.close()
+        except Exception:
+            pass
+        if self._session_db is not None:
+            try:
+                self._session_db.close()
+            except Exception:
+                pass
+            self._session_db = None
         self._app = None
         logger.info("[%s] API server stopped", self.name)
 

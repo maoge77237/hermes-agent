@@ -12,9 +12,11 @@ Tests cover:
 - Error handling (invalid JSON, missing fields)
 """
 
+import gc
 import json
 import time
 import uuid
+import weakref
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,6 +59,18 @@ class TestResponseStore:
         store = ResponseStore(max_size=10)
         store.put("resp_1", {"output": "hello"})
         assert store.get("resp_1") == {"output": "hello"}
+
+    def test_releases_sqlite_connection_on_gc(self, monkeypatch):
+        conn = MagicMock()
+        monkeypatch.setattr("gateway.platforms.api_server.sqlite3.connect", MagicMock(return_value=conn))
+
+        store = ResponseStore(max_size=10, db_path=":memory:")
+        ref = weakref.ref(store)
+        del store
+        gc.collect()
+
+        assert ref() is None
+        conn.close.assert_called_once()
 
     def test_get_missing_returns_none(self):
         store = ResponseStore(max_size=10)
@@ -117,6 +131,20 @@ class TestAdapterInit:
         assert adapter._port == 8642
         assert adapter._api_key == ""
         assert adapter.platform == Platform.API_SERVER
+
+    @pytest.mark.asyncio
+    async def test_disconnect_closes_local_stores(self):
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        response_store = MagicMock()
+        session_db = MagicMock()
+        adapter._response_store = response_store
+        adapter._session_db = session_db
+
+        await adapter.disconnect()
+
+        response_store.close.assert_called_once_with()
+        session_db.close.assert_called_once_with()
 
     def test_custom_config_from_extra(self):
         config = PlatformConfig(
